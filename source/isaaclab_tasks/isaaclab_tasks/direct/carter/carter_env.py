@@ -10,7 +10,7 @@ import torch
 from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
-from .goal import CONE_CFG
+from .goal import WAYPOINT_CFG
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
@@ -34,9 +34,13 @@ class CarterEnvCfg(DirectRLEnvCfg):
     observation_space = 1
     state_space = 0
 
-    env_spacing = 5.0 # Spacing between environments
+    env_spacing = 10.0 # Spacing between environments, depends on the amount of goals
+    num_goals = 1 # Number of goals in the environment
 
-    # simulation
+    course_length_coefficient = 2.5 # Coefficient for the length of the course
+    course_width_coefficient = 2.0 # Coefficient for the width of the course
+
+    # simulation frames Hz
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # robot
@@ -44,8 +48,8 @@ class CarterEnvCfg(DirectRLEnvCfg):
     wheels = ["left_wheel", "right_wheel"]
     caster = ["rear_pivot", "rear_axle"]
 
-    # goal
-    cone_cfg: VisualizationMarkersCfg = CONE_CFG
+    # goal waypoints
+    waypoint_cfg: VisualizationMarkersCfg = WAYPOINT_CFG
 
     # lidar
     lidar: RayCasterCfg = RayCasterCfg(
@@ -73,13 +77,27 @@ class CarterEnv(DirectRLEnv):
 
     def __init__(self, cfg: CarterEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+
+        self._num_goals = self.cfg.num_goals
+        self.env_spacing = self.cfg.env_spacing
+        self.course_length_coefficient = self.cfg.course_length_coefficient
+        self.course_width_coefficient = self.cfg.course_width_coefficient
+
         self._wheels_idx, _ = self.carter.find_joints(self.cfg.wheels)
         self._caster_idx, _ = self.carter.find_joints(self.cfg.caster)
 
-        self.num_goals = 1
+        self._goal_reached = torch.zeros((self.num_envs), dtype=torch.int32, device=self.device)
+        self.task_completed = torch.zeros((self.num_envs), dtype=torch.bool, device=self.device)
 
-        self._goal_position = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
-        self._marker_position = torch.zeros((self.num_envs, self.num_goals, 3), dtype=torch.float32, device=self.device)
+        self._goal_positions = torch.zeros((self.num_envs, self._num_goals,2), dtype=torch.float32, device=self.device)
+        self._goal_index = torch.zeros((self.num_envs), dtype=torch.int32, device=self.device)
+        self._marker_position = torch.zeros((self.num_envs, self._num_goals, 3), dtype=torch.float32, device=self.device)
+        
+        # Reward coefficients
+        self.linear_velocity_min = 0.0
+        self.linear_velocity_max = 1.0
+        self.angular_velocity_min = 0.0
+        self.angular_velocity_max = 1.0
 
     def _setup_scene(self):
         self.carter = Articulation(self.cfg.robot_cfg)
@@ -87,8 +105,8 @@ class CarterEnv(DirectRLEnv):
         # add lidar
         self.lidar = RayCaster(self.cfg.lidar)
         
-        # add goal marker
-        self.goal_marker = VisualizationMarkers(self.cfg.cone_cfg)
+        # add goal waypoints
+        self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
 
         # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -118,12 +136,16 @@ class CarterEnv(DirectRLEnv):
         self.carter.set_joint_position_target(self._caster_action, joint_ids=self._caster_idx)
 
     def _get_observations(self) -> dict:
+        # TODO: Implement observation function
+
         obs = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
         observations = {"policy": obs}
 
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
+        # TODO: Implement reward function
+        
         return torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -157,10 +179,24 @@ class CarterEnv(DirectRLEnv):
         # To rotate about Z-axis, we need to modify values in W and Z
         carter_pose[:, 3] = torch.cos(angles / 0.5)
         carter_pose[:, 6] = torch.sin(angles / 0.5)
-
+        
         self.carter.write_root_pose_to_sim(carter_pose, env_ids)
         self.carter.write_root_velocity_to_sim(carter_velocities, env_ids)
         self.carter.write_joint_state_to_sim(joint_positions, joint_velocities, None, env_ids)
 
-        
-        
+        # Reset goal
+        self._goal_positions[env_ids, :, :] = 0.0
+        self._marker_position[env_ids, :, :] = 0.0
+
+        spacing = 2 / self._num_goals
+        goal_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
+        self._goal_positions[env_ids, :len(goal_positions), 0] = goal_positions
+        self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), device=self.device, dtype=torch.float32) + self.course_length_coefficient
+        self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
+
+        self._goal_index[env_ids] = 0
+
+        # Reset markers
+        self._marker_position[env_ids, :, :2] = self._goal_positions[env_ids]
+        visualise_pos = self._marker_position.view(-1, 3)
+        self.waypoints.visualize(translations=visualise_pos)
