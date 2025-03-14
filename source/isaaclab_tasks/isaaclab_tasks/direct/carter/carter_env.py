@@ -29,9 +29,9 @@ class CarterEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2 # Decimation factor for rendering
     episode_length_s = 10.0 # Maximum episode length in seconds
-    action_space = 1 # Number of actions the neural network should return (wheel velocities)
+    action_space = 2 # Number of actions the neural network should return (wheel velocities)
     # Number of observations fed to the neural network
-    observation_space = 1
+    observation_space = 6
     state_space = 0
 
     env_spacing = 10.0 # Spacing between environments, depends on the amount of goals
@@ -126,31 +126,143 @@ class CarterEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        action_scale = 10.0
-        
-        self.actions = torch.abs(action_scale * actions.reshape(-1, 1).repeat(1, 2))
+        # Base velocity scale
+        base_velocity_scale = 10.0
+
+        # For differential drive, we directly map neural network outputs to wheel velocities
+        # This enables turning by creating a velocity differential between wheels
+
+        # For a 2-dimensional action space (common in RL):
+        # actions[:, 0] = left wheel velocity
+        # actions[:, 1] = right wheel velocity
+
+        # Apply scaling
+        left_wheel_velocity = -actions[:, 0] * base_velocity_scale
+        right_wheel_velocity = -actions[:, 1] * base_velocity_scale
+
+        # Create the final action tensor
+        self.actions = torch.stack([left_wheel_velocity, right_wheel_velocity], dim=1)
+
+        # Prepare caster action (caster is passive, no control needed)
         self._caster_action = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+
+        # Print some diagnostic information
+        if self.num_envs > 0:  # Just print first environment's actions for debugging
+            print(f"[DEBUG]Left wheel: {left_wheel_velocity[0].item():.2f}, Right wheel: {right_wheel_velocity[0].item():.2f}")
                 
     def _apply_action(self) -> None:
+
+        # Print wheel velocities for the first environment
+        if self.num_envs > 0:
+            print(f"[DEBUG]Applied wheel velocities - Left: {self.actions[0, 0].item():.2f}, Right: {self.actions[0, 1].item():.2f}")
         self.carter.set_joint_velocity_target(self.actions, joint_ids=self._wheels_idx)
         self.carter.set_joint_position_target(self._caster_action, joint_ids=self._caster_idx)
 
     def _get_observations(self) -> dict:
         # TODO: Implement observation function
 
-        obs = torch.zeros((self.num_envs, 1), dtype=torch.float32, device=self.device)
-        observations = {"policy": obs}
+        # Get current goal position
+        current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
 
+        # Calculate position error vector and magnitude
+        position_error_vector = current_goal_position - self.carter.data.root_pos_w[:, :2]
+        position_error = torch.norm(position_error_vector, dim=-1)
+
+        # Calculate heading error
+        heading = self.carter.data.heading_w
+        target_heading_w = torch.atan2(
+            current_goal_position[:, 1] - self.carter.data.root_pos_w[:, 1],
+            current_goal_position[:, 0] - self.carter.data.root_pos_w[:, 0]
+        )
+        heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
+
+        # Combine observations
+        obs = torch.cat(
+            (
+                position_error.unsqueeze(dim=1),
+                torch.cos(heading_error).unsqueeze(dim=1),
+                torch.sin(heading_error).unsqueeze(dim=1),
+                self.carter.data.root_lin_vel_b[:, 0].unsqueeze(dim=1),  # Forward velocity
+                self.carter.data.root_lin_vel_b[:, 1].unsqueeze(dim=1),  # Lateral velocity
+                self.carter.data.root_ang_vel_w[:, 2].unsqueeze(dim=1),  # Angular velocity (yaw)
+            ),
+            dim=-1
+        )
+
+        # Update the observation space to match
+        self.cfg.observation_space = obs.shape[1]
+
+        if torch.any(obs.isnan()):
+            raise ValueError("Observations cannot be NAN")
+
+        observations = {"policy": obs}
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
         # TODO: Implement reward function
         
-        return torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        # Constants for reward calculation
+        position_tolerance = 0.3  # Increased tolerance for easier goal detection
+        goal_reached_bonus = 20.0  # Bigger bonus for reaching a goal
+        heading_alignment_weight = 0.2  # Weight for aligning heading with goal
+        distance_progress_weight = 0.5  # Weight for getting closer to goal
 
+        # Get current goal position
+        current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
+
+        # Calculate position error
+        position_error_vector = current_goal_position - self.carter.data.root_pos_w[:, :2]
+        position_error = torch.norm(position_error_vector, dim=-1)
+
+        # Store previous position error for progress calculation if it doesn't exist
+        if not hasattr(self, '_previous_position_error'):
+            self._previous_position_error = position_error.clone()
+
+        # Calculate distance progress (positive when getting closer to goal)
+        distance_progress = self._previous_position_error - position_error
+
+        # Update previous position error for next step
+        self._previous_position_error = position_error.clone()
+
+        # Check if goal is reached
+        goal_reached = position_error < position_tolerance
+
+        # Calculate heading error and alignment reward
+        heading = self.carter.data.heading_w
+        target_heading_w = torch.atan2(
+            position_error_vector[:, 1],
+            position_error_vector[:, 0]
+        )
+        heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
+        heading_alignment = torch.cos(heading_error)  # 1 when perfectly aligned, -1 when facing opposite
+
+        # Calculate composite reward
+        composite_reward = (
+            heading_alignment * heading_alignment_weight +
+            distance_progress * distance_progress_weight +
+            goal_reached * goal_reached_bonus
+        )
+
+        # Update goal index if goal reached
+        self._goal_index = torch.where(goal_reached, self._goal_index + 1, self._goal_index)
+        self.task_completed = self._goal_index >= self._num_goals
+        self._goal_index = self._goal_index % self._num_goals
+
+        # Update waypoint visualization
+        one_hot_encoded = torch.nn.functional.one_hot(self._goal_index.long(), num_classes=self._num_goals)
+        marker_indices = one_hot_encoded.view(-1).tolist()
+        self.waypoints.visualize(marker_indices=marker_indices)
+
+        return composite_reward
+    
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # Task fails if episode length is exceeded
         failure_termination = self.episode_length_buf >= self.max_episode_length - 1
-        clean_termination = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+
+        # Task completes successfully if all goals are reached
+        # This is determined in _get_rewards and stored in self.task_completed
+        clean_termination = self.task_completed
+
         return failure_termination, clean_termination
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
