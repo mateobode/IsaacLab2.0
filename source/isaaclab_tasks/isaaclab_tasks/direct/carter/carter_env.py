@@ -27,15 +27,15 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 @configclass
 class CarterEnvCfg(DirectRLEnvCfg):
     # env
-    decimation = 2 # Decimation factor for rendering
-    episode_length_s = 10.0 # Maximum episode length in seconds
+    decimation = 4 # Decimation factor for rendering
+    episode_length_s = 20.0 # Maximum episode length in seconds
     action_space = 2 # Number of actions the neural network should return (wheel velocities)
     # Number of observations fed to the neural network
     observation_space = 6
     state_space = 0
 
-    env_spacing = 10.0 # Spacing between environments, depends on the amount of goals
-    num_goals = 1 # Number of goals in the environment
+    env_spacing = 30.0 # Spacing between environments, depends on the amount of goals
+    num_goals = 10 # Number of goals in the environment
 
     course_length_coefficient = 2.5 # Coefficient for the length of the course
     course_width_coefficient = 2.0 # Coefficient for the width of the course
@@ -147,20 +147,18 @@ class CarterEnv(DirectRLEnv):
         self._caster_action = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
 
         # Print some diagnostic information
-        if self.num_envs > 0:  # Just print first environment's actions for debugging
-            print(f"[DEBUG]Left wheel: {left_wheel_velocity[0].item():.2f}, Right wheel: {right_wheel_velocity[0].item():.2f}")
+        #if self.num_envs > 0:  # Just print first environment's actions for debugging
+        #    print(f"[DEBUG]Left wheel: {left_wheel_velocity[0].item():.2f}, Right wheel: {right_wheel_velocity[0].item():.2f}")
                 
     def _apply_action(self) -> None:
 
         # Print wheel velocities for the first environment
-        if self.num_envs > 0:
-            print(f"[DEBUG]Applied wheel velocities - Left: {self.actions[0, 0].item():.2f}, Right: {self.actions[0, 1].item():.2f}")
+        #if self.num_envs > 0:
+        #    print(f"[DEBUG]Applied wheel velocities - Left: {self.actions[0, 0].item():.2f}, Right: {self.actions[0, 1].item():.2f}")
         self.carter.set_joint_velocity_target(self.actions, joint_ids=self._wheels_idx)
         self.carter.set_joint_position_target(self._caster_action, joint_ids=self._caster_idx)
 
     def _get_observations(self) -> dict:
-        # TODO: Implement observation function
-
         # Get current goal position
         current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
 
@@ -199,13 +197,11 @@ class CarterEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        # TODO: Implement reward function
-        
         # Constants for reward calculation
-        position_tolerance = 0.3  # Increased tolerance for easier goal detection
-        goal_reached_bonus = 20.0  # Bigger bonus for reaching a goal
-        heading_alignment_weight = 0.2  # Weight for aligning heading with goal
-        distance_progress_weight = 0.5  # Weight for getting closer to goal
+        position_tolerance = 0.3
+        goal_reached_bonus = 20.0
+        heading_alignment_weight = 0.2
+        distance_progress_weight = 0.5
 
         # Get current goal position
         current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
@@ -214,15 +210,12 @@ class CarterEnv(DirectRLEnv):
         position_error_vector = current_goal_position - self.carter.data.root_pos_w[:, :2]
         position_error = torch.norm(position_error_vector, dim=-1)
 
-        # Store previous position error for progress calculation if it doesn't exist
+        # Store previous position error for progress calculation
         if not hasattr(self, '_previous_position_error'):
             self._previous_position_error = position_error.clone()
 
-        # Calculate distance progress (positive when getting closer to goal)
+        # Calculate distance progress
         distance_progress = self._previous_position_error - position_error
-
-        # Update previous position error for next step
-        self._previous_position_error = position_error.clone()
 
         # Check if goal is reached
         goal_reached = position_error < position_tolerance
@@ -234,7 +227,7 @@ class CarterEnv(DirectRLEnv):
             position_error_vector[:, 0]
         )
         heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
-        heading_alignment = torch.cos(heading_error)  # 1 when perfectly aligned, -1 when facing opposite
+        heading_alignment = torch.cos(heading_error)
 
         # Calculate composite reward
         composite_reward = (
@@ -243,10 +236,18 @@ class CarterEnv(DirectRLEnv):
             goal_reached * goal_reached_bonus
         )
 
-        # Update goal index if goal reached
+        # Update goal index directly 
+        # Increment target index for environments that reached their goal
         self._goal_index = torch.where(goal_reached, self._goal_index + 1, self._goal_index)
+
+        # Check if task is completed (all goals reached)
         self.task_completed = self._goal_index >= self._num_goals
+
+        # Wrap around the goal index (not resetting the environment!)
         self._goal_index = self._goal_index % self._num_goals
+
+        # Update previous position error for next step
+        self._previous_position_error = position_error.clone()
 
         # Update waypoint visualization
         one_hot_encoded = torch.nn.functional.one_hot(self._goal_index.long(), num_classes=self._num_goals)
@@ -269,46 +270,59 @@ class CarterEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.carter._ALL_INDICES
         super()._reset_idx(env_ids)
-        
+
         num_reset = len(env_ids)
 
         # Reset from config
         default_state = self.carter.data.default_root_state[env_ids]
-        carter_pose =  default_state[env_ids, :7]
-        carter_velocities = default_state[env_ids, 7:]
-        joint_positions = self.carter.data.default_joint_pos[env_ids]
-        joint_velocities = self.carter.data.default_joint_vel[env_ids]
+        carter_pose = default_state[:, :7].clone()  # Make sure to clone
+        carter_velocities = default_state[:, 7:].clone()
+        joint_positions = self.carter.data.default_joint_pos[env_ids].clone()
+        joint_velocities = self.carter.data.default_joint_vel[env_ids].clone()
 
-        carter_pose[:, :3] = self.scene.env_origins[env_ids]
+        # Add env origins
+        carter_pose[:, :3] += self.scene.env_origins[env_ids]  # Note: ADD to current positions
 
-        # Randomize starting position
-        carter_pose[:, :2] += 2.0 * torch.rand((num_reset, 2), device=self.device)
+        # Randomize starting position (but don't move too far from origin)
+        carter_pose[:, 0] -= self.env_spacing / 2  # Center the robot
+        carter_pose[:, 1] += 2.0 * torch.rand((num_reset), dtype=torch.float32, device=self.device) * self.course_width_coefficient
 
         # Randomize starting heading
-        angles = torch.pi * torch.rand((num_reset,), dtype=torch.float32, device=self.device)
+        angles = torch.pi / 6.0 * torch.rand((num_reset), dtype=torch.float32, device=self.device)
 
-        # Isaac Sim uses quaternions for rotations, quaternions are W-first (W, X, Y, Z)
-        # To rotate about Z-axis, we need to modify values in W and Z
-        carter_pose[:, 3] = torch.cos(angles / 0.5)
-        carter_pose[:, 6] = torch.sin(angles / 0.5)
-        
+        # Set quaternion for Z-axis rotation (yaw)
+        carter_pose[:, 3] = torch.cos(angles * 0.5)  # w component
+        carter_pose[:, 6] = torch.sin(angles * 0.5)  # z component
+
+        # Write to simulation
         self.carter.write_root_pose_to_sim(carter_pose, env_ids)
         self.carter.write_root_velocity_to_sim(carter_velocities, env_ids)
         self.carter.write_joint_state_to_sim(joint_positions, joint_velocities, None, env_ids)
 
-        # Reset goal
+        # Reset goals
         self._goal_positions[env_ids, :, :] = 0.0
         self._marker_position[env_ids, :, :] = 0.0
 
+        # Set up goal positions
         spacing = 2 / self._num_goals
         goal_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
         self._goal_positions[env_ids, :len(goal_positions), 0] = goal_positions
-        self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), device=self.device, dtype=torch.float32) + self.course_length_coefficient
+        self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * self.course_width_coefficient
         self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
 
+        # Reset goal index
         self._goal_index[env_ids] = 0
+
+        # Update position error
+        current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
+        position_error_vector = current_goal_position - self.carter.data.root_pos_w[:, :2]
+        position_error = torch.norm(position_error_vector, dim=-1)
+        if hasattr(self, '_previous_position_error'):
+            self._previous_position_error[env_ids] = position_error[env_ids].clone()
+        else:
+            self._previous_position_error = position_error.clone()
 
         # Reset markers
         self._marker_position[env_ids, :, :2] = self._goal_positions[env_ids]
-        visualise_pos = self._marker_position.view(-1, 3)
-        self.waypoints.visualize(translations=visualise_pos)
+        visualize_pos = self._marker_position.view(-1, 3)
+        self.waypoints.visualize(translations=visualize_pos)
