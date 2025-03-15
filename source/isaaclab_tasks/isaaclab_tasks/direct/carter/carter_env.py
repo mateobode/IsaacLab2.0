@@ -197,63 +197,52 @@ class CarterEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        # Constants for reward calculation
         position_tolerance = 0.3
         goal_reached_bonus = 20.0
+        position_progress_weight = 1.0
         heading_alignment_weight = 0.2
-        distance_progress_weight = 0.5
-
+        
         # Get current goal position
         current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
-
+        
         # Calculate position error
         position_error_vector = current_goal_position - self.carter.data.root_pos_w[:, :2]
         position_error = torch.norm(position_error_vector, dim=-1)
-
-        # Store previous position error for progress calculation
+        
+        # Store previous position error for next time if it doesn't exist
         if not hasattr(self, '_previous_position_error'):
             self._previous_position_error = position_error.clone()
-
-        # Calculate distance progress
-        distance_progress = self._previous_position_error - position_error
-
-        # Check if goal is reached
-        goal_reached = position_error < position_tolerance
-
-        # Calculate heading error and alignment reward
+        
+        # Calculate heading error
         heading = self.carter.data.heading_w
         target_heading_w = torch.atan2(
             position_error_vector[:, 1],
             position_error_vector[:, 0]
         )
         heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
-        heading_alignment = torch.cos(heading_error)
-
-        # Calculate composite reward
-        composite_reward = (
-            heading_alignment * heading_alignment_weight +
-            distance_progress * distance_progress_weight +
-            goal_reached * goal_reached_bonus
+        
+        # Use JIT-compiled function for reward calculation
+        composite_reward, self.task_completed, self._goal_index = compute_rewards(
+            position_tolerance,
+            goal_reached_bonus,
+            position_progress_weight,
+            heading_alignment_weight,
+            self._num_goals,
+            self._previous_position_error,
+            position_error,
+            heading_error,
+            self._goal_index,
+            self.task_completed
         )
-
-        # Update goal index directly 
-        # Increment target index for environments that reached their goal
-        self._goal_index = torch.where(goal_reached, self._goal_index + 1, self._goal_index)
-
-        # Check if task is completed (all goals reached)
-        self.task_completed = self._goal_index >= self._num_goals
-
-        # Wrap around the goal index (not resetting the environment!)
-        self._goal_index = self._goal_index % self._num_goals
-
+        
         # Update previous position error for next step
         self._previous_position_error = position_error.clone()
-
+        
         # Update waypoint visualization
         one_hot_encoded = torch.nn.functional.one_hot(self._goal_index.long(), num_classes=self._num_goals)
         marker_indices = one_hot_encoded.view(-1).tolist()
         self.waypoints.visualize(marker_indices=marker_indices)
-
+        
         return composite_reward
     
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -326,3 +315,48 @@ class CarterEnv(DirectRLEnv):
         self._marker_position[env_ids, :, :2] = self._goal_positions[env_ids]
         visualize_pos = self._marker_position.view(-1, 3)
         self.waypoints.visualize(translations=visualize_pos)
+
+
+@torch.jit.script
+def compute_rewards(
+    position_tolerance: float,
+    goal_reached_bonus: float,
+    position_progress_weight: float,
+    heading_alignment_weight: float,
+    num_goals: int,
+    previous_position_error: torch.Tensor,
+    position_error: torch.Tensor,
+    heading_error: torch.Tensor,
+    goal_index: torch.Tensor,
+    task_completed: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Calculate distance progress (positive when getting closer to goal)
+    position_progress = previous_position_error - position_error
+    
+    # Check if goal is reached
+    goal_reached = position_error < position_tolerance
+    
+    # Calculate heading alignment (1 when perfectly aligned, -1 when facing opposite)
+    heading_alignment = torch.cos(heading_error)
+    
+    # Calculate composite reward
+    composite_reward = (
+        position_progress * position_progress_weight +
+        heading_alignment * heading_alignment_weight +
+        goal_reached * goal_reached_bonus
+    )
+    
+    # Increment goal index for environments that reached their goal
+    new_goal_index = torch.where(goal_reached, goal_index + 1, goal_index)
+    
+    # Check if task is completed (all goals reached)
+    new_task_completed = new_goal_index >= num_goals
+    
+    # Wrap around the goal index
+    new_goal_index = new_goal_index % num_goals
+    
+    # Check for NaN values in rewards
+    if torch.any(composite_reward.isnan()):
+        raise ValueError("Rewards cannot be NAN")
+    
+    return composite_reward, new_task_completed, new_goal_index
