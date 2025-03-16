@@ -8,6 +8,9 @@ import isaaclab.sim as sim_utils
 from isaaclab.markers import VisualizationMarkersCfg
 
 
+"""Configuration for the Goals waypoint """
+
+
 WAYPOINT_CFG = VisualizationMarkersCfg(
     prim_path="/World/Visuals/Cones",
     markers={
@@ -26,7 +29,7 @@ WAYPOINT_CFG = VisualizationMarkersCfg(
     }
 )
 
-CONE_CFG = VisualizationMarkersCfg(
+GOAL_CFG = VisualizationMarkersCfg(
     prim_path="/World/Visuals/Cones",
     markers={
         # region Red Markers
