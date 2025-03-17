@@ -32,7 +32,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0 # Maximum episode length in seconds
     action_space = 2 # Number of actions the neural network should return (wheel velocities)
     # Number of observations fed to the neural network
-    observation_space = 8
+    observation_space = 6
     state_space = 0
 
     env_spacing = 30.0 # Spacing between environments, depends on the amount of goals
@@ -124,9 +124,6 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
-
-        # add walls
-        self.scene.rigid_object_collections["walls"] = self.walls
 
         # add lidar to scene
         self.scene.sensors["lidar"] = self.lidar
@@ -302,15 +299,28 @@ class CarterEnv(DirectRLEnv):
         self._goal_positions[env_ids, :, :] = 0.0
         self._marker_position[env_ids, :, :] = 0.0
 
+        # Wall spacing constraints
+        wall_half_width = 0.05
+        course_width = self.course_width_coefficient
+
+        # Calculate safe area between walls
+        safe_margin = 0.2  # Safety margin to keep waypoints away from walls
+        min_y_local = -course_width/2 + wall_half_width + safe_margin
+        max_y_local = course_width/2 - wall_half_width - safe_margin
+
         # Set up goal positions
         spacing = 2 / self._num_goals
         goal_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
         self._goal_positions[env_ids, :len(goal_positions), 0] = goal_positions
-        self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * self.course_width_coefficient
+        #self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * self.course_width_coefficient
+        #self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
+        
+        # Generate Y positions of goals between walls
+        y_positions = min_y_local + torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * (max_y_local - min_y_local)
+        self._goal_positions[env_ids, :, 1] = y_positions
+
+        # Add environment origins to goal positions
         self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
-        
-        # Set up walls
-        
 
         # Reset goal index
         self._goal_index[env_ids] = 0
