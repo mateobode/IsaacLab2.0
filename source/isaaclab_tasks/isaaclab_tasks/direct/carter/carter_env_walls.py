@@ -11,7 +11,7 @@ from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
 from .goal import WAYPOINT_CFG
-#from .walls import WALLS_CFG
+from .walls import WALL_CFG
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObjectCollection, RigidObjectCollectionCfg
@@ -32,7 +32,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0 # Maximum episode length in seconds
     action_space = 2 # Number of actions the neural network should return (wheel velocities)
     # Number of observations fed to the neural network
-    observation_space = 6
+    observation_space = 8
     state_space = 0
 
     env_spacing = 30.0 # Spacing between environments, depends on the amount of goals
@@ -53,7 +53,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     waypoint_cfg: VisualizationMarkersCfg = WAYPOINT_CFG
 
     # walls
-    #wall_collection_cfg: RigidObjectCollectionCfg = WALLS_CFG  # Ensure naming consistency
+    wall_collection_cfg: RigidObjectCollectionCfg = WALL_CFG
 
     # lidar
     lidar: RayCasterCfg = RayCasterCfg(
@@ -112,6 +112,9 @@ class CarterEnv(DirectRLEnv):
         # add goal waypoints
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
 
+        # add walls
+        self.walls = RigidObjectCollection(self.cfg.wall_collection_cfg)
+
         # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         
@@ -123,8 +126,7 @@ class CarterEnv(DirectRLEnv):
         self.scene.articulations["carter"] = self.carter
 
         # add walls
-        #self.walls = RigidObjectCollection(self.cfg.wall_collection_cfg)
-        #self.scene.rigid_object_collections["walls"] = self.walls
+        self.scene.rigid_object_collections["walls"] = self.walls
 
         # add lidar to scene
         self.scene.sensors["lidar"] = self.lidar
@@ -306,6 +308,9 @@ class CarterEnv(DirectRLEnv):
         self._goal_positions[env_ids, :len(goal_positions), 0] = goal_positions
         self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * self.course_width_coefficient
         self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
+        
+        # Set up walls
+        
 
         # Reset goal index
         self._goal_index[env_ids] = 0
