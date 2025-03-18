@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import torch
+import numpy as np
 from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
@@ -37,6 +38,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
 
     env_spacing = 30.0 # Spacing between environments, depends on the amount of goals
     num_goals = 10 # Number of goals in the environment
+    num_walls = 10 # Number of walls in the environment
 
     course_length_coefficient = 2.5 # Coefficient for the length of the course
     course_width_coefficient = 2.0 # Coefficient for the width of the course
@@ -83,6 +85,7 @@ class CarterEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         self._num_goals = self.cfg.num_goals
+        self._num_walls = self.cfg.num_walls
         self.env_spacing = self.cfg.env_spacing
         self.course_length_coefficient = self.cfg.course_length_coefficient
         self.course_width_coefficient = self.cfg.course_width_coefficient
@@ -124,6 +127,9 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
+        
+        # add walls to scene
+        self.scene.rigid_object_collections["walls"] = self.walls
 
         # add lidar to scene
         self.scene.sensors["lidar"] = self.lidar
@@ -304,7 +310,7 @@ class CarterEnv(DirectRLEnv):
         course_width = self.course_width_coefficient
 
         # Calculate safe area between walls
-        safe_margin = 0.2  # Safety margin to keep waypoints away from walls
+        safe_margin = 0.2
         min_y_local = -course_width/2 + wall_half_width + safe_margin
         max_y_local = course_width/2 - wall_half_width - safe_margin
 
@@ -312,15 +318,104 @@ class CarterEnv(DirectRLEnv):
         spacing = 2 / self._num_goals
         goal_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
         self._goal_positions[env_ids, :len(goal_positions), 0] = goal_positions
-        #self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * self.course_width_coefficient
-        #self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
-        
+
         # Generate Y positions of goals between walls
-        y_positions = min_y_local + torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * (max_y_local - min_y_local)
+        y_positions = min_y_local + torch.rand((len(env_ids), self._num_goals), dtype=torch.float32, device=self.device) * (max_y_local - min_y_local)
         self._goal_positions[env_ids, :, 1] = y_positions
 
         # Add environment origins to goal positions
         self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
+
+        # Number of wall segments per side
+        num_wall_segments = 10  # Must match number in WALL_CFG
+
+        # For each environment
+        for env_idx, env_id in enumerate(env_ids):
+            # Get waypoint positions for this environment
+            waypoints = self._goal_positions[env_id, :, :]
+
+            # Number of segments to position (limited by min of waypoints-1 and wall segments)
+            num_segments = min(num_wall_segments, self._num_goals - 1)
+
+            # For each wall segment
+            for segment in range(num_segments):
+                # Get waypoint positions that this segment connects
+                start_idx = segment
+                end_idx = segment + 1
+                if start_idx >= len(waypoints) or end_idx >= len(waypoints):
+                    continue
+
+                # Get waypoint positions (in world coordinates)
+                start_pos = waypoints[start_idx, :2]
+                end_pos = waypoints[end_idx, :2]
+
+                # Calculate segment direction
+                segment_direction = end_pos - start_pos
+                segment_length = torch.norm(segment_direction)
+
+                if segment_length > 0:  # Avoid division by zero
+                    # Normalize direction
+                    segment_direction = segment_direction / segment_length
+
+                    # Calculate perpendicular direction for wall placement
+                    perp_direction = torch.tensor([-segment_direction[1], segment_direction[0]], device=self.device)
+
+                    # Position of left and right walls (at segment midpoint)
+                    segment_midpoint = (start_pos + end_pos) / 2
+                    corridor_width = self.course_width_coefficient
+
+                    # Left wall position
+                    left_wall_pos = segment_midpoint + perp_direction * (-corridor_width/2)
+                    # Right wall position
+                    right_wall_pos = segment_midpoint + perp_direction * (corridor_width/2)
+
+                    # Wall orientation (rotation around Z-axis to align with segment)
+                    wall_angle = torch.atan2(segment_direction[1], segment_direction[0])
+
+                    # Convert to quaternion (rotation around Z-axis)
+                    wall_quat_w = torch.cos(wall_angle * 0.5)
+                    wall_quat_z = torch.sin(wall_angle * 0.5)
+                    wall_quat = torch.tensor([wall_quat_w, 0.0, 0.0, wall_quat_z], device=self.device)
+
+                    # Create position tensors
+                    left_wall_pos_tensor = torch.zeros(3, device=self.device)
+                    left_wall_pos_tensor[0] = left_wall_pos[0]
+                    left_wall_pos_tensor[1] = left_wall_pos[1]
+                    left_wall_pos_tensor[2] = 0.25  # Half height above ground
+
+                    right_wall_pos_tensor = torch.zeros(3, device=self.device)
+                    right_wall_pos_tensor[0] = right_wall_pos[0]
+                    right_wall_pos_tensor[1] = right_wall_pos[1]
+                    right_wall_pos_tensor[2] = 0.25  # Half height above ground
+
+                    # Create pose tensors (concatenate position and quaternion)
+                    left_wall_pose = torch.cat([left_wall_pos_tensor, wall_quat])
+                    right_wall_pose = torch.cat([right_wall_pos_tensor, wall_quat])
+
+                    # Calculate object indices for left and right walls
+                    left_wall_obj_id = torch.tensor([segment], device=self.device)
+                    right_wall_obj_id = torch.tensor([segment + num_wall_segments], device=self.device)
+
+                    # Single environment ID tensor
+                    env_id_tensor = torch.tensor([env_idx], device=self.device)
+
+                    # Write wall poses to simulation
+                    try:
+                        # Set left wall pose
+                        self.walls.write_object_pose_to_sim(
+                            left_wall_pose.unsqueeze(0).unsqueeze(0),  # Shape: [1, 1, 7]
+                            env_ids=env_id_tensor,
+                            object_ids=left_wall_obj_id
+                        )
+
+                        # Set right wall pose
+                        self.walls.write_object_pose_to_sim(
+                            right_wall_pose.unsqueeze(0).unsqueeze(0),  # Shape: [1, 1, 7]
+                            env_ids=env_id_tensor,
+                            object_ids=right_wall_obj_id
+                        )
+                    except Exception as e:
+                        print(f"Error setting wall position: {e}")
 
         # Reset goal index
         self._goal_index[env_ids] = 0
