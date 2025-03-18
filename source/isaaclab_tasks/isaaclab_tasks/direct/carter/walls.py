@@ -72,7 +72,7 @@ WALL_CFG = RigidObjectCollectionCfg(
             init_state=RigidObjectCfg.InitialStateCfg(
                 pos=(0.0, 0.0, 0.25)
             )
-        ) for i in range(9)},
+        ) for i in range(10)},
         
         **{f"right_wall_{i}": RigidObjectCfg(
             prim_path=f"/World/envs/env_.*/right_wall_{i}",
@@ -90,6 +90,6 @@ WALL_CFG = RigidObjectCollectionCfg(
             init_state=RigidObjectCfg.InitialStateCfg(
                 pos=(0.0, 0.0, 0.25)
             )
-        ) for i in range(9)}
+        ) for i in range(10)}
     }
 )
