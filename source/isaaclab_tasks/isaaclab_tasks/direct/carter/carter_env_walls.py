@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import torch
-import numpy as np
 from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
@@ -21,7 +20,6 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-#from isaaclab.sensors.ray_caster import RayCaster, RayCasterCfg, patterns
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 
@@ -57,24 +55,6 @@ class CarterEnvCfg(DirectRLEnvCfg):
     # walls
     wall_collection_cfg: RigidObjectCollectionCfg = WALL_CFG
 
-    # lidar
-    #lidar: RayCasterCfg = RayCasterCfg(
-    #    prim_path="/World/envs/env_.*/Robot/chassis_link/carter_lidar",
-    #    update_period=1 / 60,
-    #    offset=RayCasterCfg.OffsetCfg(
-    #        pos=(-0.06, 0.0, 0.38),
-    #    ),
-    #    mesh_prim_paths=["/World/ground"],
-    #    attach_yaw_only=True,
-    #    pattern_cfg=patterns.LidarPatternCfg(
-    #        channels=100,
-    #        vertical_fov_range=(-90, 90),
-    #        horizontal_fov_range=(-90, 90),
-    #        horizontal_res=1.0,
-    #    ),
-    #    debug_vis=True,
-    #)
-
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=env_spacing, replicate_physics=True)
 
@@ -109,9 +89,6 @@ class CarterEnv(DirectRLEnv):
     def _setup_scene(self):
         self.carter = Articulation(self.cfg.robot_cfg)
         
-        # add lidar
-        #self.lidar = RayCaster(self.cfg.lidar)
-        
         # add goal waypoints
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
 
@@ -127,9 +104,6 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
-
-        # add lidar to scene
-        #self.scene.sensors["lidar"] = self.lidar
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
