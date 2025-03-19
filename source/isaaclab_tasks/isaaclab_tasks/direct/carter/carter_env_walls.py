@@ -21,7 +21,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-from isaaclab.sensors.ray_caster import RayCaster, RayCasterCfg, patterns
+#from isaaclab.sensors.ray_caster import RayCaster, RayCasterCfg, patterns
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 
@@ -38,7 +38,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
 
     env_spacing = 30.0 # Spacing between environments, depends on the amount of goals
     num_goals = 10 # Number of goals in the environment
-    num_walls = 10 # Number of walls in the environment
+    num_walls = 9 # Number of walls in the environment
 
     course_length_coefficient = 2.5 # Coefficient for the length of the course
     course_width_coefficient = 2.0 # Coefficient for the width of the course
@@ -58,22 +58,22 @@ class CarterEnvCfg(DirectRLEnvCfg):
     wall_collection_cfg: RigidObjectCollectionCfg = WALL_CFG
 
     # lidar
-    lidar: RayCasterCfg = RayCasterCfg(
-        prim_path="/World/envs/env_.*/Robot/chassis_link/carter_lidar",
-        update_period=1 / 60,
-        offset=RayCasterCfg.OffsetCfg(
-            pos=(0.0, 0.0, 0.5),
-        ),
-        mesh_prim_paths=["/World/ground"],
-        attach_yaw_only=True,
-        pattern_cfg=patterns.LidarPatternCfg(
-            channels=100,
-            vertical_fov_range=[-90, 90],
-            horizontal_fov_range=[-180, 180],
-            horizontal_res=1.0,
-        ),
-        debug_vis=False,
-    )
+    #lidar: RayCasterCfg = RayCasterCfg(
+    #    prim_path="/World/envs/env_.*/Robot/chassis_link/carter_lidar",
+    #    update_period=1 / 60,
+    #    offset=RayCasterCfg.OffsetCfg(
+    #        pos=(-0.06, 0.0, 0.38),
+    #    ),
+    #    mesh_prim_paths=["/World/ground"],
+    #    attach_yaw_only=True,
+    #    pattern_cfg=patterns.LidarPatternCfg(
+    #        channels=100,
+    #        vertical_fov_range=(-90, 90),
+    #        horizontal_fov_range=(-90, 90),
+    #        horizontal_res=1.0,
+    #    ),
+    #    debug_vis=True,
+    #)
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=env_spacing, replicate_physics=True)
@@ -110,7 +110,7 @@ class CarterEnv(DirectRLEnv):
         self.carter = Articulation(self.cfg.robot_cfg)
         
         # add lidar
-        self.lidar = RayCaster(self.cfg.lidar)
+        #self.lidar = RayCaster(self.cfg.lidar)
         
         # add goal waypoints
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
@@ -127,12 +127,9 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
-        
-        # add walls to scene
-        self.scene.rigid_object_collections["walls"] = self.walls
 
         # add lidar to scene
-        self.scene.sensors["lidar"] = self.lidar
+        #self.scene.sensors["lidar"] = self.lidar
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -326,24 +323,21 @@ class CarterEnv(DirectRLEnv):
         # Add environment origins to goal positions
         self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
 
-        # Number of wall segments per side
-        num_wall_segments = 10  # Must match number in WALL_CFG
-
         # For each environment
         for env_idx, env_id in enumerate(env_ids):
             # Get waypoint positions for this environment
             waypoints = self._goal_positions[env_id, :, :]
 
             # Number of segments to position (limited by min of waypoints-1 and wall segments)
-            num_segments = min(num_wall_segments, self._num_goals - 1)
+            num_segments = min(self._num_walls, self._num_goals - 1)
 
             # For each wall segment
             for segment in range(num_segments):
                 # Get waypoint positions that this segment connects
                 start_idx = segment
                 end_idx = segment + 1
-                if start_idx >= len(waypoints) or end_idx >= len(waypoints):
-                    continue
+                #if start_idx >= len(waypoints) or end_idx >= len(waypoints):
+                #    continue
 
                 # Get waypoint positions (in world coordinates)
                 start_pos = waypoints[start_idx, :2]
@@ -394,7 +388,7 @@ class CarterEnv(DirectRLEnv):
 
                     # Calculate object indices for left and right walls
                     left_wall_obj_id = torch.tensor([segment], device=self.device)
-                    right_wall_obj_id = torch.tensor([segment + num_wall_segments], device=self.device)
+                    right_wall_obj_id = torch.tensor([segment + self._num_walls], device=self.device)
 
                     # Single environment ID tensor
                     env_id_tensor = torch.tensor([env_idx], device=self.device)
