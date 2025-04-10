@@ -302,15 +302,6 @@ class CarterEnv(DirectRLEnv):
         # Reset goal index
         self._goal_index[env_ids] = 0
 
-        # Update position error
-        current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
-        position_error_vector = current_goal_position - self.carter.data.root_pos_w[:, :2]
-        position_error = torch.norm(position_error_vector, dim=-1)
-        if hasattr(self, '_previous_position_error'):
-            self._previous_position_error[env_ids] = position_error[env_ids].clone()
-        else:
-            self._previous_position_error = position_error.clone()
-
         # Reset markers
         self._marker_position[env_ids, :, :2] = self._goal_positions[env_ids]
         visualize_pos = self._marker_position.view(-1, 3)
