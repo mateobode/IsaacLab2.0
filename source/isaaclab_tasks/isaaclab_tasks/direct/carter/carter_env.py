@@ -235,6 +235,12 @@ class CarterEnv(DirectRLEnv):
         visualize_pos = self._marker_position.view(-1, 3)
         self.waypoints.visualize(translations=visualize_pos)
 
+        # Reset position error
+        current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
+        self._position_error_vector = current_goal_position[:, :2] - self.carter.data.root_pos_w[:, :2]
+        self._position_error = torch.norm(self._position_error_vector, dim=-1)
+        self._previous_position_error = self._position_error.clone()
+
         # Reset heading error
         heading = self.carter.data.heading_w[:]
         target_heading_w = torch.atan2(
