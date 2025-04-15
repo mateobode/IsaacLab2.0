@@ -247,8 +247,8 @@ class CarterEnv(DirectRLEnv):
             self._goal_positions[:, 0, 1] - self.carter.data.root_link_pos_w[:, 1],
             self._goal_positions[:, 0, 0] - self.carter.data.root_link_pos_w[:, 0],
         )
-        self._heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
-        self._previous_heading_error = self._heading_error.clone()
+        self.goal_heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
+        self._previous_heading_error = self.goal_heading_error.clone()
 
 @torch.jit.script
 def compute_rewards(
