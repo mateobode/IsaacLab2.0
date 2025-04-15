@@ -79,7 +79,6 @@ class CarterEnv(DirectRLEnv):
         self.position_tolerance: float = 0.15 # Tolerance for the position of the robot
         self.goal_reached_reward = 10.0
         self.position_progress_weight = 1.0
-        #self.heading_coefficient = 0.25
         self.heading_progress_weight = 0.05
 
     def _setup_scene(self):
@@ -160,7 +159,6 @@ class CarterEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         # Jit TorchScript for calculating rewards
         composite_reward, self.task_completed, self._goal_index = compute_rewards(
-            #self.heading_coefficient,
             self.position_tolerance,
             self._num_goals,
             self.position_progress_weight,
@@ -248,7 +246,6 @@ class CarterEnv(DirectRLEnv):
 
 @torch.jit.script
 def compute_rewards(
-    #heading_coefficient: float,
     position_tolerance: float,
     _num_goals: int,
     position_progress_weight: float,
@@ -262,7 +259,7 @@ def compute_rewards(
 ):
     # Position progress
     position_progress_reward = _previous_position_error - _position_error
-    # Heading progress
+    # Heading progress (1 when perfectly aligned, -1 when facing opposite)
     goal_heading_reward = torch.cos(goal_heading_error)
     # Check if goal is reached
     goal_reached = _position_error < position_tolerance
