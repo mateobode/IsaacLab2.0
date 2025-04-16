@@ -11,9 +11,10 @@ from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
 from .goal import WAYPOINT_CFG
+from .walls import WALL_CFG, WALLS_CFG
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.assets import Articulation, ArticulationCfg, RigidObjectCollection, RigidObjectCollectionCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
@@ -41,7 +42,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     course_width_coefficient = 2.0 # Coefficient for the width of the course
 
     # simulation frames Hz
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 60, render_interval=decimation)
 
     # robot
     robot_cfg: ArticulationCfg = CARTER_V1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
@@ -50,6 +51,9 @@ class CarterEnvCfg(DirectRLEnvCfg):
 
     # goal waypoints
     waypoint_cfg: VisualizationMarkersCfg = WAYPOINT_CFG
+
+    # walls
+    wall_collection_cfg: RigidObjectCollectionCfg = WALL_CFG
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=env_spacing, replicate_physics=True)
@@ -84,6 +88,8 @@ class CarterEnv(DirectRLEnv):
     def _setup_scene(self):
         self.carter = Articulation(self.cfg.robot_cfg)
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
+        self.walls = RigidObjectCollection(self.cfg.wall_collection_cfg)
+        self.wall_state = []
 
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         
@@ -93,6 +99,8 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
+        # add walls as collection to scene
+        self.scene.rigid_object_collections["walls"] = self.walls
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -234,6 +242,31 @@ class CarterEnv(DirectRLEnv):
         self._marker_position[env_ids, :, :2] = self._goal_positions[env_ids]
         visualize_pos = self._marker_position.view(-1, 3)
         self.waypoints.visualize(translations=visualize_pos)
+
+        # Walls
+        num_walls = len(WALLS_CFG.rigid_objects)
+        # Default wall state [pos, quat, lin_vel, ang_vel] in local environment frame
+        self.wall_state = self.walls.data.default_object_state.clone()
+        wall_ids = torch.arange(num_walls, device=self.device) # Unique index for each wall
+
+        # Reset walls
+        offset = 2.75
+        self.wall_positions1 = self._goal_positions[env_ids]
+        self.wall_positions2 = self._goal_positions[env_ids]
+        offset = torch.full((num_reset, self._num_goals), fill_value=offset, dtype=torch.float32, device=self.device)
+        sign_pattern = torch.tensor([1 if j%2 == 0 else -1 for j in range(self._num_goals)], device=self.device)
+        offset[:, :] *= sign_pattern
+        self.wall_positions1[:, :, 0] += offset # Tensor size self._num_goals
+        self.wall_positions2[:, :, 0] -= offset # Tensor size self._num_goals
+        self.wall_positions = torch.cat([self.wall_positions1, self.wall_positions2], dim=1)
+
+        # The idea is to add the self.wall_positions to the self.wall_state with the correct Wall position for each Wall in the ENV
+        # Pad the tensor to have 3 dimensions by adding a column of zeros for the third dimension
+        padded_wall_positions = torch.cat((self.wall_positions, torch.zeros(self.wall_positions.shape[0], self.wall_positions.shape[1], 1, device=self.wall_positions.device)), dim=2)
+        self.wall_state[env_ids, :, :3] = padded_wall_positions
+        print(f"env_ids before function call: {env_ids}, type: {type(env_ids)}, device: {env_ids.device if isinstance(env_ids, torch.Tensor) else 'CPU'}")
+        # Set the wall pose over selected environment and wall indexes into the simulation
+        self.walls.write_object_link_pose_to_sim(self.wall_state[env_ids, :, :7], env_ids, wall_ids)
 
         # Reset position error
         current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
