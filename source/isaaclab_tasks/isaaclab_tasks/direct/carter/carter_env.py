@@ -47,7 +47,6 @@ class CarterEnvCfg(DirectRLEnvCfg):
     # robot
     robot_cfg: ArticulationCfg = CARTER_V1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     wheels = ["left_wheel", "right_wheel"]
-    caster = ["rear_pivot", "rear_axle"]
 
     # goal waypoints
     waypoint_cfg: VisualizationMarkersCfg = WAYPOINT_CFG
@@ -70,7 +69,6 @@ class CarterEnv(DirectRLEnv):
         self.course_width_coefficient = self.cfg.course_width_coefficient
 
         self._wheels_idx, _ = self.carter.find_joints(self.cfg.wheels)
-        self._caster_idx, _ = self.carter.find_joints(self.cfg.caster)
 
         self._goal_reached = torch.zeros((self.num_envs), dtype=torch.int32, device=self.device)
         self.task_completed = torch.zeros((self.num_envs), dtype=torch.bool, device=self.device)
@@ -122,13 +120,9 @@ class CarterEnv(DirectRLEnv):
 
         # Create the final action tensor
         self.actions = torch.stack([left_wheel_velocity, right_wheel_velocity], dim=1)
-
-        # Passive caster
-        self._caster_action = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
                 
     def _apply_action(self) -> None:
         self.carter.set_joint_velocity_target(self.actions, joint_ids=self._wheels_idx)
-        self.carter.set_joint_position_target(self._caster_action, joint_ids=self._caster_idx)
 
     def _get_observations(self) -> dict:
         # Calculate position error
@@ -243,29 +237,38 @@ class CarterEnv(DirectRLEnv):
         visualize_pos = self._marker_position.view(-1, 3)
         self.waypoints.visualize(translations=visualize_pos)
 
-        # Walls
-        num_walls = len(WALLS_CFG.rigid_objects)
-        # Default wall state [pos, quat, lin_vel, ang_vel] in local environment frame
-        self.wall_state = self.walls.data.default_object_state.clone()
-        wall_ids = torch.arange(num_walls, device=self.device) # Unique index for each wall
-
         # Reset walls
-        offset = 2.75
-        self.wall_positions1 = self._goal_positions[env_ids]
-        self.wall_positions2 = self._goal_positions[env_ids]
-        offset = torch.full((num_reset, self._num_goals), fill_value=offset, dtype=torch.float32, device=self.device)
-        sign_pattern = torch.tensor([1 if j%2 == 0 else -1 for j in range(self._num_goals)], device=self.device)
-        offset[:, :] *= sign_pattern
-        self.wall_positions1[:, :, 0] += offset # Tensor size self._num_goals
-        self.wall_positions2[:, :, 0] -= offset # Tensor size self._num_goals
-        self.wall_positions = torch.cat([self.wall_positions1, self.wall_positions2], dim=1)
-
-        # The idea is to add the self.wall_positions to the self.wall_state with the correct Wall position for each Wall in the ENV
-        # Pad the tensor to have 3 dimensions by adding a column of zeros for the third dimension
-        padded_wall_positions = torch.cat((self.wall_positions, torch.zeros(self.wall_positions.shape[0], self.wall_positions.shape[1], 1, device=self.wall_positions.device)), dim=2)
-        self.wall_state[env_ids, :, :3] = padded_wall_positions
-        print(f"env_ids before function call: {env_ids}, type: {type(env_ids)}, device: {env_ids.device if isinstance(env_ids, torch.Tensor) else 'CPU'}")
-        # Set the wall pose over selected environment and wall indexes into the simulation
+        num_walls = len(WALLS_CFG.rigid_objects)
+        self.wall_state = self.walls.data.default_object_state.clone()
+        wall_ids = torch.arange(num_walls, device=self.device)
+        
+        # Simple corridor parameters
+        corridor_width = 4.0  # Wider corridor for easier navigation
+        wall_z_height = 0.25  # Standard height for walls
+        
+        for i in range(num_reset):
+            # We'll create a simple corridor along the path
+            for j in range(self._num_goals):
+                goal_pos = self._goal_positions[env_ids[i], j]
+                
+                # For each goal, place 2 walls (one on each side)
+                if 2*j < num_walls:
+                    # Left wall - offset to the left of the goal
+                    self.wall_state[env_ids[i], 2*j, 0] = goal_pos[0]  # Same x as goal
+                    self.wall_state[env_ids[i], 2*j, 1] = goal_pos[1] + corridor_width/2  # Offset in y
+                    self.wall_state[env_ids[i], 2*j, 2] = wall_z_height  # Z position
+                    
+                    # Right wall - offset to the right of the goal
+                    self.wall_state[env_ids[i], 2*j+1, 0] = goal_pos[0]  # Same x as goal
+                    self.wall_state[env_ids[i], 2*j+1, 1] = goal_pos[1] - corridor_width/2  # Offset in y
+                    self.wall_state[env_ids[i], 2*j+1, 2] = wall_z_height  # Z position
+                    
+                    # Standard orientation (no rotation) for stability
+                    # Quaternion components (w,x,y,z) for identity rotation
+                    self.wall_state[env_ids[i], 2*j, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+                    self.wall_state[env_ids[i], 2*j+1, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        
+        # Set the wall pose in simulation
         self.walls.write_object_link_pose_to_sim(self.wall_state[env_ids, :, :7], env_ids, wall_ids)
 
         # Reset position error

@@ -17,19 +17,21 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 CARTER_V1_ACTUATOR_CFG = ImplicitActuatorCfg(
     joint_names_expr=["left_wheel", "right_wheel"],
-    effort_limit=40000.0,
-    velocity_limit=100.0,
+    #effort_limit=40000.0,
+    effort_limit=100.0,
+    #velocity_limit=100.0,
     stiffness=0.0,
-    damping=10.0,
+    #damping=10.0,
+    damping=1.0e3
 )
 
-CASTER_CFG = ImplicitActuatorCfg(
-    joint_names_expr=["rear_pivot", "rear_axle"],
-    effort_limit=0.0,
-    velocity_limit=0.0,
-    stiffness=0.0,
-    damping=0.0,
-)
+#CASTER_CFG = ImplicitActuatorCfg(
+#    joint_names_expr=["rear_pivot", "rear_axle"],
+#    effort_limit=0.0,
+#    velocity_limit=0.0,
+#    stiffness=0.0,
+#    damping=0.0,
+#)
 
 ##
 # Configuration - Articulation
@@ -70,7 +72,7 @@ CARTER_V1_CFG = ArticulationCfg(
     ),
     actuators={
         "wheels": CARTER_V1_ACTUATOR_CFG,
-        "caster": CASTER_CFG,
+        #"caster": CASTER_CFG,
     },
 )
 
