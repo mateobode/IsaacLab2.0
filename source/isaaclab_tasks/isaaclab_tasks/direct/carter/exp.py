@@ -33,7 +33,11 @@ class ContactSensorSceneCfg(InteractiveSceneCfg):
     
     ground = AssetBaseCfg(
         prim_path="/World/defaultGroundPlane",
-        spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
+        spawn=sim_utils.GroundPlaneCfg()
+    )
+
+    dome_light = AssetBaseCfg(
+        prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )
 
     robot = CARTER_V1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -42,8 +46,8 @@ class ContactSensorSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Wall",
         spawn=sim_utils.CuboidCfg(
             size =(2.0, 2.0, 1.0),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.5, 0.5, 0.5),
                 metallic=0.2,
@@ -93,11 +97,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             scene.reset()
             print("[INFO]: Resetting robot state...")
         # Apply default actions to the robot
-        # -- generate actions/commands
-        targets = scene["robot"].data.default_joint_pos
-        # -- apply action to the robot
-        scene["robot"].set_joint_position_target(targets)
-        # -- write data to sim
+        target_velocities = torch.zeros_like(scene["robot"].data.joint_pos)
+        target_velocities[:, 0] = -2.0 # Left wheel
+        target_velocities[:, 1] = -2.0 # Right wheel
+        print(f"Target velocities: {target_velocities}")
+        scene["robot"].set_joint_velocity_target(target_velocities)
+        
         scene.write_data_to_sim()
         # perform step
         sim.step()
@@ -109,18 +114,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
         # print information from the sensors
         print("-------------------------------")
-        print(scene["contact_forces_LF"])
-        print("Received force matrix of: ", scene["contact_forces_LF"].data.force_matrix_w)
-        print("Received contact force of: ", scene["contact_forces_LF"].data.net_forces_w)
+        print(scene["contact_forces"])
+        print("Received force matrix of: ", scene["contact_forces"].data.force_matrix_w)
+        print("Received contact force of: ", scene["contact_forces"].data.net_forces_w)
         print("-------------------------------")
-        print(scene["contact_forces_RF"])
-        print("Received force matrix of: ", scene["contact_forces_RF"].data.force_matrix_w)
-        print("Received contact force of: ", scene["contact_forces_RF"].data.net_forces_w)
-        print("-------------------------------")
-        print(scene["contact_forces_H"])
-        print("Received force matrix of: ", scene["contact_forces_H"].data.force_matrix_w)
-        print("Received contact force of: ", scene["contact_forces_H"].data.net_forces_w)
-
 
 def main():
     """Main function."""

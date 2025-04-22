@@ -18,7 +18,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 CARTER_V1_ACTUATOR_CFG = ImplicitActuatorCfg(
     joint_names_expr=["left_wheel", "right_wheel"],
     #effort_limit=40000.0,
-    effort_limit=100.0,
+    effort_limit_sim=100.0,
     #velocity_limit=100.0,
     stiffness=0.0,
     #damping=10.0,
@@ -61,7 +61,7 @@ CARTER_V1_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.05),
+        pos=(0.0, 0.0, 0.0),
         rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos={
             "left_wheel": 0.0,
