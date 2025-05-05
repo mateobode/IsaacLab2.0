@@ -7,12 +7,16 @@
 from __future__ import annotations
 
 import torch
+import omni.usd
+import carb
+
 from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
 from .goal import WAYPOINT_CFG
 
 import isaaclab.sim as sim_utils
+import omni.anim.navigation.core as nav
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -76,7 +80,20 @@ class CarterEnvCfg(DirectRLEnvCfg):
     maze_cfg: sim_utils.UsdFileCfg = sim_utils.UsdFileCfg(usd_path="/home/nakamuralab/Desktop/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/carter/asset/maze.usd")
 
     # lidar
-    
+    #lidar: RayCasterCfg = RayCasterCfg(
+    #    prim_path="/World/envs/env_.*/chassis_link/carter_lidar",
+    #    update_period=1/60,
+    #    offset= RayCasterCfg.OffsetCfg(pos=(-0.06, 0.0, 0.38)),
+    #    mesh_prim_paths=["/World/envs/env_.*/Maze"],
+    #    attach_yaw_only=True,
+    #    pattern_cfg=patterns.LidarPatternCfg(
+    #        channels=100,
+    #        vertical_fov_range=[-90, 90],
+    #        horizontal_fov_range=[-90, 90],
+    #        horizontal_res=1.0,
+    #    ),
+    #    debug_vis=True,
+    #)
     
     # goal waypoints
     waypoint_cfg: VisualizationMarkersCfg = WAYPOINT_CFG
@@ -115,6 +132,9 @@ class CarterEnv(DirectRLEnv):
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
         self.maze = self.cfg.maze_cfg.func("/World/envs/env_.*/Maze", self.cfg.maze_cfg)
 
+        self.inav = nav.acquire_interface()
+        self.inav.force_navmesh_baking()
+
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         
         # clone, filter, and replicate
@@ -123,6 +143,8 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
+        # add lidar to scene
+        #self.scene.sensors["lidar"] = RayCaster(self.cfg.lidar)
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -233,25 +255,46 @@ class CarterEnv(DirectRLEnv):
         self._goal_positions[env_ids, :, :] = 0.0
         self._marker_position[env_ids, :, :] = 0.0
 
-        maze_waypoints = torch.tensor([
-            [1.0, 1.0],    # Example: first waypoint
-            [3.0, 1.0],    # Example: second waypoint 
-            [3.0, 3.0],    # Example: third waypoint
-            [5.0, 3.0],    # And so on...
-            [5.0, 5.0],
-            [7.0, 5.0],
-            [7.0, 7.0],
-            [9.0, 7.0],
-            [9.0, 9.0],
-            [11.0, 9.0],
-        ], device=self.device)
-
-        # Ensure we don't exceed the number of waypoints defined
-        num_waypoints = min(self._num_goals, maze_waypoints.shape[0])
-
-        # Assign waypoints to each environment
+        # Randomize goal positions inside the maze
         for env_idx in env_ids:
-            self._goal_positions[env_idx, :num_waypoints, :] = maze_waypoints[:num_waypoints, :] + self.scene.env_origins[env_idx, :2]
+            start_point = self.inav.random_navmesh_point()
+            self._goal_positions[env_idx, :, 0] = torch.tensor([start_point[0], start_point[2]], device=self.device)
+
+            last_point = start_point
+            for i in range(1, self._num_goals):
+                best_point = None
+                best_distance = 0
+
+                for _ in range(self._num_goals):
+                    point = self.inav.random_navmesh_point()
+
+                    path = self.inav.query_navmesh_path(
+                        (last_point[0], last_point[1], last_point[2]),
+                        (point[0], point[1], point[2]),
+                    )
+
+                    try:
+                        path_points = path.query_navmesh_path().get_points()
+
+                        path_distance = len(path_points)
+                        if 2 <= path_distance <= self._num_goals:
+                            direct_distance = ((point[0] - last_point[0]) ** 2 + 
+                                               (point[2] - last_point[2]) ** 2) ** 0.5
+                            if direct_distance > best_distance:
+                                best_distance = direct_distance
+                                best_point = point
+                    except:
+                        continue
+
+            if best_point is not None:
+                self._goal_positions[env_idx, i, :] = torch.tensor([best_point[0], best_point[2]], device=self.device)
+                last_point = best_point
+            else:
+                fallback_point = self.inav.random_navmesh_point()
+                self._goal_positions[env_idx, i, :] = torch.tensor([fallback_point[0], fallback_point[2]], device=self.device)
+                last_point = fallback_point
+
+        self._goal_positions[env_ids, :, :] += self.scene.env_origins[env_idx, :2]
 
         # Reset goal index
         self._goal_index[env_ids] = 0
