@@ -1,7 +1,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-
+import omni
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -95,12 +95,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             scene["robot"].write_joint_state_to_sim(joint_pos, joint_vel)
             # clear internal buffers
             scene.reset()
-            print("[INFO]: Resetting robot state...")
+            #print("[INFO]: Resetting robot state...")
         # Apply default actions to the robot
         target_velocities = torch.zeros_like(scene["robot"].data.joint_pos)
         target_velocities[:, 0] = -2.0 # Left wheel
         target_velocities[:, 1] = -2.0 # Right wheel
-        print(f"Target velocities: {target_velocities}")
+        #print(f"Target velocities: {target_velocities}")
         scene["robot"].set_joint_velocity_target(target_velocities)
         
         scene.write_data_to_sim()
@@ -113,11 +113,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         scene.update(sim_dt)
 
         # print information from the sensors
-        print("-------------------------------")
-        print(scene["contact_forces"])
-        print("Received force matrix of: ", scene["contact_forces"].data.force_matrix_w)
-        print("Received contact force of: ", scene["contact_forces"].data.net_forces_w)
-        print("-------------------------------")
+        #print("-------------------------------")
+        #print(scene["contact_forces"])
+        #print("Received force matrix of: ", scene["contact_forces"].data.force_matrix_w)
+        #print("Received contact force of: ", scene["contact_forces"].data.net_forces_w)
+        #print("-------------------------------")
 
 def main():
     """Main function."""
@@ -134,6 +134,8 @@ def main():
     sim.reset()
     # Now we are ready!
     print("[INFO]: Setup complete...")
+    cmd=omni.kit.commands.get_commands_list()
+    print(cmd)
     # Run the simulator
     run_simulator(sim, scene)
 
