@@ -11,16 +11,14 @@ from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
 from .goal import WAYPOINT_CFG
-from .walls import WALL_CFG, WALLS_CFG
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, ArticulationCfg, RigidObjectCollection, RigidObjectCollectionCfg
+from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-from isaaclab.sensors.ray_caster import RayCaster, RayCasterCfg, patterns
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 
@@ -35,7 +33,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     observation_space = 6
     state_space = 0
 
-    env_spacing = 30.0 # Spacing between environments, depends on the amount of goals
+    env_spacing = 20.0 # Spacing between environments, depends on the amount of goals
     num_goals = 10 # Number of goals in the environment
 
     course_length_coefficient = 2.5 # Coefficient for the length of the course
@@ -50,9 +48,6 @@ class CarterEnvCfg(DirectRLEnvCfg):
 
     # goal waypoints
     waypoint_cfg: VisualizationMarkersCfg = WAYPOINT_CFG
-
-    # walls
-    wall_collection_cfg: RigidObjectCollectionCfg = WALL_CFG
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=env_spacing, replicate_physics=True)
@@ -78,16 +73,14 @@ class CarterEnv(DirectRLEnv):
         self._marker_position = torch.zeros((self.num_envs, self._num_goals, 3), dtype=torch.float32, device=self.device)
         
         # Reward parameters
-        self.position_tolerance: float = 0.15 # Tolerance for the position of the robot
-        self.goal_reached_reward = 10.0
+        self.position_tolerance: float = 0.5 # Tolerance for the position of the robot
+        self.goal_reached_reward = 20.0
         self.position_progress_weight = 1.0
-        self.heading_progress_weight = 0.05
+        self.heading_progress_weight = 1.0
 
     def _setup_scene(self):
         self.carter = Articulation(self.cfg.robot_cfg)
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
-        self.walls = RigidObjectCollection(self.cfg.wall_collection_cfg)
-        self.wall_state = []
 
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         
@@ -97,29 +90,14 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
-        # add walls as collection to scene
-        self.scene.rigid_object_collections["walls"] = self.walls
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        base_velocity_scale = 10.0
-
-        # For differential drive, we directly map neural network outputs to wheel velocities
-        # This enables turning by creating a velocity differential between wheels
-
-        # For a 2-dimensional action space (common in RL):
-        # actions[:, 0] = left wheel velocity
-        # actions[:, 1] = right wheel velocity
-
-        # Scaling
-        left_wheel_velocity = -actions[:, 0] * base_velocity_scale
-        right_wheel_velocity = -actions[:, 1] * base_velocity_scale
-
-        # Create the final action tensor
-        self.actions = torch.stack([left_wheel_velocity, right_wheel_velocity], dim=1)
+        action_scale = 10.0
+        self.actions = actions.clone() * action_scale
                 
     def _apply_action(self) -> None:
         self.carter.set_joint_velocity_target(self.actions, joint_ids=self._wheels_idx)
@@ -182,7 +160,6 @@ class CarterEnv(DirectRLEnv):
     
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         task_failed = self.episode_length_buf > self.max_episode_length
-
         # Task completed is determined in _get_rewards
         return task_failed, self.task_completed
 
@@ -236,40 +213,6 @@ class CarterEnv(DirectRLEnv):
         self._marker_position[env_ids, :, :2] = self._goal_positions[env_ids]
         visualize_pos = self._marker_position.view(-1, 3)
         self.waypoints.visualize(translations=visualize_pos)
-
-        # Reset walls
-        num_walls = len(WALLS_CFG.rigid_objects)
-        self.wall_state = self.walls.data.default_object_state.clone()
-        wall_ids = torch.arange(num_walls, device=self.device)
-        
-        # Simple corridor parameters
-        corridor_width = 4.0  # Wider corridor for easier navigation
-        wall_z_height = 0.25  # Standard height for walls
-        
-        for i in range(num_reset):
-            # We'll create a simple corridor along the path
-            for j in range(self._num_goals):
-                goal_pos = self._goal_positions[env_ids[i], j]
-                
-                # For each goal, place 2 walls (one on each side)
-                if 2*j < num_walls:
-                    # Left wall - offset to the left of the goal
-                    self.wall_state[env_ids[i], 2*j, 0] = goal_pos[0]  # Same x as goal
-                    self.wall_state[env_ids[i], 2*j, 1] = goal_pos[1] + corridor_width/2  # Offset in y
-                    self.wall_state[env_ids[i], 2*j, 2] = wall_z_height  # Z position
-                    
-                    # Right wall - offset to the right of the goal
-                    self.wall_state[env_ids[i], 2*j+1, 0] = goal_pos[0]  # Same x as goal
-                    self.wall_state[env_ids[i], 2*j+1, 1] = goal_pos[1] - corridor_width/2  # Offset in y
-                    self.wall_state[env_ids[i], 2*j+1, 2] = wall_z_height  # Z position
-                    
-                    # Standard orientation (no rotation) for stability
-                    # Quaternion components (w,x,y,z) for identity rotation
-                    self.wall_state[env_ids[i], 2*j, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-                    self.wall_state[env_ids[i], 2*j+1, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
-        
-        # Set the wall pose in simulation
-        self.walls.write_object_link_pose_to_sim(self.wall_state[env_ids, :, :7], env_ids, wall_ids)
 
         # Reset position error
         current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]

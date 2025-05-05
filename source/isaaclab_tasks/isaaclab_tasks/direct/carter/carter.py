@@ -17,21 +17,10 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 CARTER_V1_ACTUATOR_CFG = ImplicitActuatorCfg(
     joint_names_expr=["left_wheel", "right_wheel"],
-    #effort_limit=40000.0,
     effort_limit_sim=100.0,
-    #velocity_limit=100.0,
     stiffness=0.0,
-    #damping=10.0,
-    damping=1.0e3
+    damping=50.0 # Reduced from 1.0e3, tune this value (10-100 is often reasonable)
 )
-
-#CASTER_CFG = ImplicitActuatorCfg(
-#    joint_names_expr=["rear_pivot", "rear_axle"],
-#    effort_limit=0.0,
-#    velocity_limit=0.0,
-#    stiffness=0.0,
-#    damping=0.0,
-#)
 
 ##
 # Configuration - Articulation
@@ -39,7 +28,7 @@ CARTER_V1_ACTUATOR_CFG = ImplicitActuatorCfg(
 
 CARTER_V1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Carter/carter_v1_physx_lidar.usd",
+        usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Carter/carter_v1.usd",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             #disable_gravity=False,
@@ -55,13 +44,13 @@ CARTER_V1_CFG = ArticulationCfg(
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
             solver_position_iteration_count=4,
-            solver_velocity_iteration_count=0,
+            solver_velocity_iteration_count=0, # Use 0 for TGS, 1 for PGS
             sleep_threshold=0.005,
             stabilization_threshold=0.001,
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.0),
+        pos=(0.0, 0.0, 0.0), # Z should be slightly above ground if needed
         rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos={
             "left_wheel": 0.0,
@@ -69,10 +58,17 @@ CARTER_V1_CFG = ArticulationCfg(
             "rear_pivot": 0.0,
             "rear_axle": 0.0
         },
+        lin_vel=(0.0, 0.0, 0.0),
+        ang_vel=(0.0, 0.0, 0.0),
+        joint_vel={
+            "left_wheel": 0.0,
+            "right_wheel": 0.0,
+            "rear_pivot": 0.0,
+            "rear_axle": 0.0
+        }
     ),
     actuators={
         "wheels": CARTER_V1_ACTUATOR_CFG,
-        #"caster": CASTER_CFG,
     },
 )
 
