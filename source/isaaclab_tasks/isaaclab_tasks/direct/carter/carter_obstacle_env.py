@@ -7,22 +7,17 @@
 from __future__ import annotations
 
 import torch
-import omni.usd
-import carb
-
 from collections.abc import Sequence
 
 from .carter import CARTER_V1_CFG
 from .goal import WAYPOINT_CFG
 
 import isaaclab.sim as sim_utils
-import omni.anim.navigation.core as nav
-from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.assets import Articulation, ArticulationCfg, AssetBase, AssetBaseCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
-from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.sensors import RayCaster, RayCasterCfg, patterns
+from isaaclab.sensors import RayCaster, RayCasterCfg, ContactSensor, ContactSensorCfg, patterns
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -46,55 +41,45 @@ class CarterEnvCfg(DirectRLEnvCfg):
     course_width_coefficient = 2.0 # Coefficient for the width of the course
 
     # simulation frames Hz
-    sim: SimulationCfg = SimulationCfg(
-        dt=1 / 60, 
-        render_interval=decimation,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
-            static_friction=0.8,
-            dynamic_friction=0.8,
-            restitution=0.0,
-        )
-    )
-
-    terrain: TerrainImporterCfg = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="plane",
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
-            static_friction=0.8,
-            dynamic_friction=0.8,
-            restitution=0.0,
-        ),
-        debug_vis=False,
-    )
+    sim: SimulationCfg = SimulationCfg(dt=1 / 60, render_interval=decimation)
 
     # robot
     robot_cfg: ArticulationCfg = CARTER_V1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     wheels = ["left_wheel", "right_wheel"]
 
-    # maze
-    maze_cfg: sim_utils.UsdFileCfg = sim_utils.UsdFileCfg(usd_path="/home/nakamuralab/Desktop/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/carter/asset/maze.usd")
+    # obstacles
+    obstacle_cfg: AssetBaseCfg = AssetBaseCfg(
+        prim_path="/World/Obstacle",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path="source/isaaclab_tasks/isaaclab_tasks/direct/carter/asset/obstacle.usd"
+        )
+    )
 
-    # lidar
-    #lidar: RayCasterCfg = RayCasterCfg(
-    #    prim_path="/World/envs/env_.*/chassis_link/carter_lidar",
-    #    update_period=1/60,
-    #    offset= RayCasterCfg.OffsetCfg(pos=(-0.06, 0.0, 0.38)),
-    #    mesh_prim_paths=["/World/envs/env_.*/Maze"],
-    #    attach_yaw_only=True,
-    #    pattern_cfg=patterns.LidarPatternCfg(
-    #        channels=100,
-    #        vertical_fov_range=[-90, 90],
-    #        horizontal_fov_range=[-90, 90],
-    #        horizontal_res=1.0,
-    #    ),
-    #    debug_vis=True,
-    #)
-    
+    #lidar
+    lidar_cfg: RayCasterCfg = RayCasterCfg(
+        prim_path="/World/envs/env_.*/Robot/chassis_link",
+        update_period=1 / 60,
+        offset=RayCasterCfg.OffsetCfg(pos=(-0.06, 0.0, 0.38)),
+        mesh_prim_paths=["/World/Obstacle"],
+        attach_yaw_only=True,
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=100, 
+            vertical_fov_range=(-90, 90), 
+            horizontal_fov_range=(-90, 90), 
+            horizontal_res=1.0,
+        ),
+        debug_vis=True
+    )
+
+    # Contact sensor configuration
+    contact_sensor_cfg: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/chassis_link",
+        update_period=0.0,
+        history_length=6,
+        debug_vis=True,
+        filter_prim_paths_expr=["/World/Obstacle"],
+    )
+
     # goal waypoints
     waypoint_cfg: VisualizationMarkersCfg = WAYPOINT_CFG
 
@@ -130,12 +115,16 @@ class CarterEnv(DirectRLEnv):
     def _setup_scene(self):
         self.carter = Articulation(self.cfg.robot_cfg)
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
-        self.maze = self.cfg.maze_cfg.func("/World/envs/env_.*/Maze", self.cfg.maze_cfg)
-
-        self.inav = nav.acquire_interface()
-        self.inav.force_navmesh_baking()
+        self.lidar = RayCaster(self.cfg.lidar_cfg)
+        self.contact_sensor = ContactSensor(self.cfg.contact_sensor_cfg)
 
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+
+        self.obstacle = self.cfg.obstacle_cfg
+        self.obstacle.spawn.func(
+            self.obstacle.prim_path, 
+            self.obstacle.spawn
+        )
         
         # clone, filter, and replicate
         self.scene.clone_environments(copy_from_source=False) # Clone child environments from parent environment
@@ -143,8 +132,9 @@ class CarterEnv(DirectRLEnv):
 
         # add articulation to scene
         self.scene.articulations["carter"] = self.carter
-        # add lidar to scene
-        #self.scene.sensors["lidar"] = RayCaster(self.cfg.lidar)
+        # add sensors to scene
+        self.scene.sensors["lidar"] = self.lidar
+        self.scene.sensors["contact_sensor"] = self.contact_sensor
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -255,50 +245,15 @@ class CarterEnv(DirectRLEnv):
         self._goal_positions[env_ids, :, :] = 0.0
         self._marker_position[env_ids, :, :] = 0.0
 
-        # Randomize goal positions inside the maze
-        for env_idx in env_ids:
-            start_point = self.inav.random_navmesh_point()
-            self._goal_positions[env_idx, :, 0] = torch.tensor([start_point[0], start_point[2]], device=self.device)
-
-            last_point = start_point
-            for i in range(1, self._num_goals):
-                best_point = None
-                best_distance = 0
-
-                for _ in range(self._num_goals):
-                    point = self.inav.random_navmesh_point()
-
-                    path = self.inav.query_navmesh_path(
-                        (last_point[0], last_point[1], last_point[2]),
-                        (point[0], point[1], point[2]),
-                    )
-
-                    try:
-                        path_points = path.query_navmesh_path().get_points()
-
-                        path_distance = len(path_points)
-                        if 2 <= path_distance <= self._num_goals:
-                            direct_distance = ((point[0] - last_point[0]) ** 2 + 
-                                               (point[2] - last_point[2]) ** 2) ** 0.5
-                            if direct_distance > best_distance:
-                                best_distance = direct_distance
-                                best_point = point
-                    except:
-                        continue
-
-            if best_point is not None:
-                self._goal_positions[env_idx, i, :] = torch.tensor([best_point[0], best_point[2]], device=self.device)
-                last_point = best_point
-            else:
-                fallback_point = self.inav.random_navmesh_point()
-                self._goal_positions[env_idx, i, :] = torch.tensor([fallback_point[0], fallback_point[2]], device=self.device)
-                last_point = fallback_point
-
-        self._goal_positions[env_ids, :, :] += self.scene.env_origins[env_idx, :2]
+        spacing = 2 / self._num_goals
+        goal_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
+        self._goal_positions[env_ids, :len(goal_positions), 0] = goal_positions
+        self._goal_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) * self.course_length_coefficient
+        self._goal_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
 
         # Reset goal index
         self._goal_index[env_ids] = 0
-        
+
         # Reset visual markers
         self._marker_position[env_ids, :, :2] = self._goal_positions[env_ids]
         visualize_pos = self._marker_position.view(-1, 3)
