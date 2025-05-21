@@ -24,6 +24,7 @@ CARTER_V1_ACTUATOR_CFG = ImplicitActuatorCfg(
 
 ##
 # Configuration - Articulation
+# For Carter Lidar Environment use carter_v1_physx_lidar.usd
 ##
 
 CARTER_V1_CFG = ArticulationCfg(
