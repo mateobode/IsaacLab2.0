@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import torch
-import omni
-import asyncio
+import omni.usd
+
 from collections.abc import Sequence
+from typing import List, Optional, Union, cast
 
 from .carter import CARTER_V1_CFG
 from .goal import WAYPOINT_CFG
@@ -17,14 +18,19 @@ from .walls import WALL_CFG, WALLS_CFG
 
 
 import isaaclab.sim as sim_utils
-from isaacsim.sensors.physx import _range_sensor
+
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObjectCollection, RigidObjectCollectionCfg
+
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+# Add imports for contact sensors
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
+# Import the physx interface for LiDAR
+from isaacsim.sensors.physx import _range_sensor
 
 
 @configclass
@@ -34,7 +40,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0 # Maximum episode length in seconds
     action_space = 2 # Number of actions the neural network should return (wheel velocities)
     # Number of observations fed to the neural network
-    observation_space = 38 # Number of observations fed to the neural network
+    observation_space = 38 # Updated: base observations (6) + LiDAR (32)
     state_space = 0
 
     env_spacing = 30.0 # Spacing between environments, depends on the amount of goals
@@ -49,7 +55,7 @@ class CarterEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 60, render_interval=decimation)
 
     # robot
-    robot_cfg: ArticulationCfg = CARTER_V1_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot_cfg: ArticulationCfg = CARTER_V1_CFG.replace(prim_path="/World/envs/env_.*/Robot")  # type: ignore[attr-defined]
     wheels = ["left_wheel", "right_wheel"]
 
     # goal waypoints
@@ -57,6 +63,15 @@ class CarterEnvCfg(DirectRLEnvCfg):
 
     # walls
     wall_collection_cfg: RigidObjectCollectionCfg = WALL_CFG
+
+    # Contact sensor configuration
+    contact_sensor_cfg: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/chassis_link",
+        update_period=0.0,
+        history_length=6,
+        debug_vis=True,
+        filter_prim_paths_expr=["/World/{ENV_REGEX_NS}/Wall_.*"],  # Walls are our obstacles
+    )
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=env_spacing, replicate_physics=True)
@@ -83,24 +98,70 @@ class CarterEnv(DirectRLEnv):
         self._goal_index = torch.zeros((self.num_envs), dtype=torch.int32, device=self.device)
         self._marker_position = torch.zeros((self.num_envs, self._num_goals, 3), dtype=torch.float32, device=self.device)
 
-        self._sector_distances = torch.ones((self.num_envs, self._lidar_num_sectors), dtype=torch.float32, device=self.device) * self._lidar_max_range
-        
-        # Penalty parameters
-        self.obstacle_penalty_weight: float = 0.05
-        self.min_safe_distance: float = 0.8
-        self.max_lidar_penalty_range: float = 1.5
+        # New collision penalty parameters
+        self.collision_penalty: float = 30.0  # Large penalty for collisions
+
+        self.proximity_penalty_scale: float = 5.0  # Penalty scale for proximity to obstacles
+        # Add minimum distance threshold - no penalty beyond this distance
+        self.proximity_min_distance: float = 0.8  # Only apply penalty when closer than this distance (meters)
+
+        # New collision detection flag - ensure it has the right shape from the beginning
+        # Make sure it's initialized with shape [num_envs]
+        self.collision_detected = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # LiDAR interface for processing data
+        self.lidar_interface = _range_sensor.acquire_lidar_sensor_interface()
+        # Store LiDAR paths for each environment
+        self.lidar_paths = []
 
         # Reward parameters
         self.position_tolerance: float = 0.5 # Tolerance for the position of the robot
-        self.goal_reached_reward: float = 20.0
+        self.goal_reached_reward: float = 50.0
         self.position_progress_weight: float = 1.0
         self.heading_progress_weight: float = 1.0
+
+        # Debug flag - set to True to print penalty and distance information
+        self.debug_penalties = False
+
+    def _find_lidar_paths(self):
+        """Find all LiDAR paths in the scene for each environment."""
+        stage = omni.usd.get_context().get_stage()
+        self.lidar_paths = []
+        
+        # For each environment, find the LiDAR path
+        for env_idx in range(self.num_envs):
+            # Try with environment namespace
+            test_path = f"/World/envs/env_{env_idx}/Robot/chassis_link/carter_lidar"
+            if stage.GetPrimAtPath(test_path).IsValid():
+                self.lidar_paths.append(test_path)
+            else:
+                # If not found, try with just the environment number
+                test_path = f"/World/env_{env_idx}/Robot/chassis_link/carter_lidar"
+                if stage.GetPrimAtPath(test_path).IsValid():
+                    self.lidar_paths.append(test_path)
+                else:
+                    # If still not found, log a warning
+                    print(f"Warning: Could not find LiDAR for environment {env_idx}")
+                    self.lidar_paths.append(None)
+                    
+        # If we couldn't find any LiDAR paths, try a more general search
+        if all(path is None for path in self.lidar_paths):
+            print("Searching for any LiDAR in the scene...")
+            for prim in stage.Traverse():
+                if "lidar" in prim.GetPath().pathString.lower():
+                    print(f"Found potential LiDAR at: {prim.GetPath()}")
+                    # If we find one, use it for all environments
+                    self.lidar_paths = [str(prim.GetPath())] * self.num_envs
+                    break
 
     def _setup_scene(self):
         self.carter = Articulation(self.cfg.robot_cfg)
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
         self.walls = RigidObjectCollection(self.cfg.wall_collection_cfg)
         self.wall_state = []
+        
+        # Initialize the contact sensor
+        self.contact_sensor = ContactSensor(self.cfg.contact_sensor_cfg)
         
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         
@@ -111,33 +172,11 @@ class CarterEnv(DirectRLEnv):
         self.scene.articulations["carter"] = self.carter
         # add walls as collection to scene
         self.scene.rigid_object_collections["walls"] = self.walls
-        
-        # add lidar
-        stage = omni.usd.get_context().get_stage()
-        self.lidar_interface = _range_sensor.acquire_lidar_sensor_interface()
-        omni.kit.commands.execute('AddPhysicsSceneCommand', stage=stage, path='/World/PhysicsScene')
+        # add sensors to scene
+        self.scene.sensors["contact_sensor"] = self.contact_sensor
 
-        for env_idx in range(self.num_envs):
-            # Get lidar path for each environment
-            env_lidar_path = f"/World/envs/env_{env_idx}/Robot/chassis_link/carter_lidar"
-            if self.lidar_interface.is_lidar_sensor(env_lidar_path):
-                print("Lidar sensor is valid!")
-            result, _ = omni.kit.commands.execute(
-                "RangeSensorCreateLidar",
-                path=env_lidar_path,
-                min_range=0.4,
-                max_range=100.0,
-                draw_points=True,
-                draw_lines=False,
-                horizontal_fov=180.0,
-                vertical_fov=30.0,
-                horizontal_resolution=0.4,
-                vertical_resolution=4.0,
-                rotation_rate=0.0,
-                high_lod=False,
-                yaw_offset=0.0,
-                enable_semantics=False,
-            )
+        # Find all LiDAR paths after scene setup
+        self._find_lidar_paths()
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -149,122 +188,6 @@ class CarterEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         self.carter.set_joint_velocity_target(self.actions, joint_ids=self._wheels_idx)
-    
-    def _get_lidar_data(self, lidar_interface):
-        """Get LIDAR data from the simulation."""
-
-        expected_points = int(180.0/0.4) # 180 degrees with 0.4 degree resolution
-        all_lidar_data = torch.ones((self.num_envs, expected_points), device=self.device) * self.cfg.lidar_max_range
-        
-        for env_idx in range(self.num_envs):
-            env_lidar_path = f"/World/envs/env_{env_idx}/Robot/chassis_link/carter_lidar"
-
-            try:
-                depth = lidar_interface.get_linear_depth_data(env_lidar_path)                
-                
-                if depth is not None and len(depth) > 0:
-                    depth_tensor = torch.tensor(depth, device=self.device)
-                    # Check if the depth data is valid
-                    if len(depth_tensor) != expected_points:
-                        if len(depth_tensor) < expected_points:
-                            # Pad with max range values
-                            padded = torch.ones(expected_points, device=self.device) * self.cfg.lidar_max_range
-                            padded[:len(depth_tensor)] = depth_tensor
-                            all_lidar_data[env_idx] = padded
-                        else:
-                            # Use middle section if we have more points than expected
-                            middle_start = (len(depth_tensor) - expected_points) // 2
-                            all_lidar_data[env_idx] = depth_tensor[middle_start:middle_start+expected_points] 
-                else:
-                    # Correct size
-                    all_lidar_data[env_idx] = depth_tensor
-            
-            except Exception as e:
-                # Print error for debugging
-                print(f"Error getting LIDAR data for env {env_idx}: {e}")
-
-        return all_lidar_data
-
-    def _process_lidar_data(self, all_lidar_data):
-        """Process LIDAR data to extract useful features for navigation."""
-        
-        num_envs = all_lidar_data.shape[0]
-        num_points = all_lidar_data.shape[1]
-        num_sectors = self.cfg.lidar_num_sectors
-        max_range = self.cfg.lidar_max_range
-
-        # Reset sector distances tensor
-        self._sector_distances.fill_(max_range)
-        
-        # Calculate points per sector
-        points_per_sector = num_points // num_sectors
-        if points_per_sector == 0:
-            points_per_sector = 1
-            sectors_to_use = min(num_points, num_sectors)
-        else:
-            sectors_to_use = num_sectors
-
-        # Process each environment using vectorized operations where possible
-        for env_idx in range(num_envs):
-            # Reshape data to handle processing in chunks
-            # Handle the case where points aren't evenly divisible by sectors
-            usable_points = points_per_sector * sectors_to_use
-            if usable_points > num_points:
-                usable_points = num_points - (num_points % sectors_to_use)
-
-            # Create valid data mask (between min_range and max_range)
-            valid_mask = (all_lidar_data[env_idx, :usable_points] > 0.4) & (all_lidar_data[env_idx, :usable_points] < max_range)
-            valid_data = torch.where(valid_mask, all_lidar_data[env_idx, :usable_points], torch.tensor(max_range, device=self.device))
-
-            # Process each sector
-            for sector_idx in range(sectors_to_use):
-                start_idx = sector_idx * points_per_sector
-                end_idx = min(start_idx + points_per_sector, usable_points)
-
-                if start_idx < end_idx:  # Ensure valid range
-                    # Get minimum distance in this sector
-                    sector_values = valid_data[start_idx:end_idx]
-                    if len(sector_values) > 0:
-                        min_val = torch.min(sector_values)
-
-                        # Map 180° FOV to appropriate sectors in 360° view
-                        # This mapping assumes the LIDAR faces forward and covers -90° to +90°
-
-                        # Calculate actual sector in 360° view
-                        # For 32 sectors, we map:
-                        # - Far left (-90°) to sector 24
-                        # - Front center (0°) to sector 0/31 (split)
-                        # - Far right (+90°) to sector 8
-
-                        front_center = 0  # Sector directly in front
-                        half_sectors = num_sectors // 2
-                        quarter_sectors = num_sectors // 4
-
-                        # Linear mapping from sensor FOV to sector indices
-                        normalized_pos = sector_idx / sectors_to_use  # 0.0 (left) to 1.0 (right)
-                        angular_pos = normalized_pos * 180.0 - 90.0  # -90° (left) to +90° (right)
-
-                        # Convert to sector index
-                        if angular_pos < 0:  # Left side (-90° to 0°)
-                            # Map to left quadrants (sectors from front_center to front_center+half_sectors)
-                            sector_angle = 180.0 / half_sectors
-                            angle_from_front = abs(angular_pos)
-                            actual_sector_idx = front_center + int(angle_from_front / sector_angle)
-                            actual_sector_idx = actual_sector_idx % num_sectors
-                        else:  # Right side (0° to +90°)
-                            # Map to right quadrants (sectors from front_center-1 down to front_center-quarter_sectors)
-                            sector_angle = 90.0 / quarter_sectors
-                            actual_sector_idx = front_center - 1 - int(angular_pos / sector_angle)
-                            actual_sector_idx = (actual_sector_idx + num_sectors) % num_sectors
-
-                        # Update the sector distance if this reading is closer
-                        if min_val < self._sector_distances[env_idx, actual_sector_idx]:
-                            self._sector_distances[env_idx, actual_sector_idx] = min_val
-    
-        # Normalize distances to [0, 1] range for neural network input
-        normalized_distances = self._sector_distances / max_range
-    
-        return normalized_distances
 
     def _get_observations(self) -> dict:
         # Calculate position error
@@ -281,11 +204,77 @@ class CarterEnv(DirectRLEnv):
         )
         self.goal_heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
 
-        all_lidar_data = self._get_lidar_data(self.lidar_interface)
-        processed_lidar = self._process_lidar_data(all_lidar_data)
+        # Process LiDAR data using the PhysX interface
+        lidar_sectors = torch.ones((self.num_envs, self._lidar_num_sectors), device=self.device) * self._lidar_max_range
+        
+        for env_idx in range(self.num_envs):
+            if env_idx < len(self.lidar_paths) and self.lidar_paths[env_idx] is not None:
+                try:
+                    # Get depth data from the LiDAR
+                    depth_data = self.lidar_interface.get_linear_depth_data(self.lidar_paths[env_idx])
+                    if depth_data is not None and len(depth_data) > 0:
+                        # Convert numpy array to torch tensor
+                        depth_tensor = torch.tensor(depth_data, device=self.device)
+                        
+                        # Reshape if needed based on the data format
+                        if len(depth_tensor.shape) > 1:
+                            # If 2D, flatten to 1D
+                            depth_tensor = depth_tensor.flatten()
+                        
+                        # Bin the data into sectors
+                        num_points = len(depth_tensor)
+                        points_per_sector = max(1, num_points // self._lidar_num_sectors)
+                        
+                        for i in range(self._lidar_num_sectors):
+                            start_idx = i * points_per_sector
+                            end_idx = min((i + 1) * points_per_sector, num_points)
+                            
+                            if start_idx < end_idx:
+                                # Get minimum distance in each sector
+                                sector_data = depth_tensor[start_idx:end_idx]
+                                # Replace infinity values with max range
+                                sector_data = torch.where(
+                                    torch.isinf(sector_data),
+                                    torch.tensor(self._lidar_max_range, device=self.device),
+                                    sector_data
+                                )
+                                if len(sector_data) > 0:
+                                    lidar_sectors[env_idx, i] = torch.min(sector_data)
+                except Exception as e:
+                    print(f"Error reading LiDAR data for env {env_idx}: {e}")
+        
+        # Normalize LiDAR readings to [0, 1] range
+        lidar_sectors = lidar_sectors / self._lidar_max_range
+        
+        # Check for collisions using contact sensor
+        contact_forces = self.contact_sensor.data.net_forces_w
+        
+        # For debugging:
+        # print(f"contact_forces shape: {contact_forces.shape}, num_envs: {self.num_envs}")
+        
+        # Handle the contact forces tensor properly based on its shape
+        if len(contact_forces.shape) > 2:
+            # If we have a 3D tensor, flatten all but the first dimension
+            reshaped_forces = contact_forces.reshape(contact_forces.shape[0], -1)
+            contact_magnitude = torch.norm(reshaped_forces, dim=1)
+        else:
+            # Standard case: calculate norm along the last dimension
+            contact_magnitude = torch.norm(contact_forces, dim=-1)
+        
+        # If contact_magnitude has more elements than num_envs, 
+        # take the maximum value per environment
+        if contact_magnitude.shape[0] > self.num_envs:
+            # Reshape to [num_envs, N]
+            n_per_env = contact_magnitude.shape[0] // self.num_envs
+            contact_magnitude = contact_magnitude.reshape(self.num_envs, n_per_env)
+            # Take max for each environment
+            contact_magnitude = torch.max(contact_magnitude, dim=1)[0]
+        
+        # Now contact_magnitude should be [num_envs]
+        self.collision_detected = contact_magnitude > 0.1  # Force threshold for collision detection
 
         # Combine observations
-        obs = torch.cat(
+        base_obs = torch.cat(
             (
                 self._position_error.unsqueeze(dim=1),
                 torch.cos(self.goal_heading_error).unsqueeze(dim=1),
@@ -293,10 +282,12 @@ class CarterEnv(DirectRLEnv):
                 self.carter.data.root_lin_vel_b[:, 0].unsqueeze(dim=1),  # Forward velocity
                 self.carter.data.root_lin_vel_b[:, 1].unsqueeze(dim=1),  # Lateral velocity
                 self.carter.data.root_ang_vel_w[:, 2].unsqueeze(dim=1),  # Angular velocity (yaw)
-                processed_lidar,
             ),
             dim=-1
         )
+        
+        # Combine base observations with LiDAR data
+        obs = torch.cat((base_obs, lidar_sectors), dim=1)
         
         if torch.any(obs.isnan()):
             raise ValueError("Observations cannot be NAN")
@@ -305,7 +296,7 @@ class CarterEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        # Jit TorchScript for calculating rewards
+        # Original reward calculation from the jit TorchScript
         composite_reward, self.task_completed, self._goal_index = compute_rewards(
             self.position_tolerance,
             self._num_goals,
@@ -317,25 +308,123 @@ class CarterEnv(DirectRLEnv):
             self.goal_heading_error,
             self.task_completed,
             self._goal_index,
-            self.obstacle_penalty_weight,
-            self.min_safe_distance,
-            self._sector_distances,
-            self.max_lidar_penalty_range,
         )
+
+        # Add proximity penalty from LiDAR data
+        proximity_penalty = torch.zeros((self.num_envs), device=self.device)
+        
+        for env_idx in range(self.num_envs):
+            if env_idx < len(self.lidar_paths) and self.lidar_paths[env_idx] is not None:
+                try:
+                    depth_data = self.lidar_interface.get_linear_depth_data(self.lidar_paths[env_idx])
+                    if depth_data is not None and len(depth_data) > 0:
+                        # Convert to tensor and handle infinite values
+                        depth_tensor = torch.tensor(depth_data, device=self.device)
+                        depth_tensor = torch.where(
+                            torch.isinf(depth_tensor),
+                            torch.tensor(self._lidar_max_range, device=self.device),
+                            depth_tensor
+                        )
+                        
+                        # Calculate minimum distance to obstacles
+                        min_distance = torch.min(depth_tensor)
+                        
+                        # Apply proximity penalty - only if closer than min distance threshold
+                        if min_distance < self.proximity_min_distance:
+                            # Calculate how close we are to the minimum safe distance (0 to 1 scale)
+                            # 0 means at the min distance, 1 means touching the obstacle
+                            proximity_ratio = 1.0 - (min_distance / self.proximity_min_distance)
+                            
+                            # Apply a quadratic penalty curve that increases more sharply as the robot gets very close
+                            # This gives a more gradual penalty at medium distances but still strong avoidance when very close
+                            proximity_penalty[env_idx] = self.proximity_penalty_scale * (proximity_ratio ** 2)
+                            
+                            # Debug information
+                            if self.debug_penalties and env_idx == 0:  # Only print for the first environment to avoid spam
+                                print(f"Min distance: {min_distance:.2f}m, Proximity ratio: {proximity_ratio:.2f}, Penalty: {proximity_penalty[env_idx]:.2f}")
+                except Exception as e:
+                    print(f"Error calculating proximity penalty for env {env_idx}: {e}")
+        
+        # Apply collision penalty
+        collision_penalty = self.collision_detected * self.collision_penalty
+        
+        # Debug information for collision detection
+        if self.debug_penalties and torch.any(self.collision_detected):
+            num_collisions = torch.sum(self.collision_detected).item()
+            print(f"Collisions detected: {num_collisions}, Penalty per collision: {self.collision_penalty}")
+        
+        # Add penalties to the original reward
+        original_reward = composite_reward.clone()
+        composite_reward = composite_reward - proximity_penalty - collision_penalty
+        
+        # Debug reward components
+        if self.debug_penalties:
+            # Calculate average penalties across environments
+            avg_proximity_penalty = torch.mean(proximity_penalty).item()
+            avg_collision_penalty = torch.mean(collision_penalty).item()
+            avg_original_reward = torch.mean(original_reward).item()
+            avg_final_reward = torch.mean(composite_reward).item()
+            
+            # Only print every 20 steps to reduce spam
+            if self.episode_length_buf[0] % 20 == 0:
+                print("\nReward components:")
+                print(f"Original reward: {avg_original_reward:.2f}")
+                print(f"Proximity penalty: {avg_proximity_penalty:.2f}")
+                print(f"Collision penalty: {avg_collision_penalty:.2f}")
+                print(f"Final reward: {avg_final_reward:.2f}")
+                print("-------------------")
 
         # Update waypoint visualization
         one_hot_encoded = torch.nn.functional.one_hot(self._goal_index.long(), num_classes=self._num_goals)
         marker_indices = one_hot_encoded.view(-1).tolist()
         self.waypoints.visualize(marker_indices=marker_indices)
         
+        if torch.any(composite_reward.isnan()):
+            raise ValueError("Rewards cannot be NAN")
+
         return composite_reward
     
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        task_failed = self.episode_length_buf > self.max_episode_length
+        # Debug information
+        # print(f"episode_length_buf shape: {self.episode_length_buf.shape}, collision_detected shape: {self.collision_detected.shape}")
+        
+        # Make sure both tensors have the same shape before logical_or
+        episode_timeout = self.episode_length_buf > self.max_episode_length
+        
+        # Ensure the collision_detected tensor has the right shape
+        if self.collision_detected.shape != episode_timeout.shape:
+            try:
+                # Try reshaping if possible (should be broadcast-compatible)
+                if self.collision_detected.numel() == self.num_envs:
+                    self.collision_detected = self.collision_detected.reshape(episode_timeout.shape)
+                elif self.collision_detected.numel() > self.num_envs:
+                    # If we have more elements, take the ones we need
+                    self.collision_detected = self.collision_detected[:self.num_envs]
+                else:
+                    # If we have too few elements, pad with False
+                    print(f"Warning: collision_detected has too few elements: {self.collision_detected.shape}")
+                    padded = torch.zeros(episode_timeout.shape, dtype=torch.bool, device=self.device)
+                    padded[:self.collision_detected.numel()] = self.collision_detected
+                    self.collision_detected = padded
+            except Exception as e:
+                # In case of errors, just ignore collisions for safety
+                print(f"Error reshaping collision_detected: {e}")
+                print(f"episode_timeout: {episode_timeout.shape}, collision_detected: {self.collision_detected.shape}")
+                self.collision_detected = torch.zeros_like(episode_timeout)
+        
+        # Task failed conditions with more explicit error handling
+        try:
+            task_failed = torch.logical_or(episode_timeout, self.collision_detected)
+        except Exception as e:
+            print(f"Error in logical_or: {e}")
+            # Fallback to just using episode_timeout
+            task_failed = episode_timeout
+        
         # Task completed is determined in _get_rewards
         return task_failed, self.task_completed
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
+        # Keep the original implementation without modifications
         if env_ids is None:
             env_ids = self.carter._ALL_INDICES
         super()._reset_idx(env_ids)
@@ -390,7 +479,7 @@ class CarterEnv(DirectRLEnv):
         num_walls = len(WALLS_CFG.rigid_objects)
         self.wall_state = self.walls.data.default_object_state.clone()
         wall_ids = torch.arange(num_walls, device=self.device)
-        
+    
         # Simple corridor parameters
         corridor_width = 4.0  # Wider corridor for easier navigation
         wall_z_height = 0.25  # Standard height for walls
@@ -419,7 +508,16 @@ class CarterEnv(DirectRLEnv):
         
         # Set the wall pose in simulation
         self.walls.write_object_link_pose_to_sim(self.wall_state[env_ids, :, :7], env_ids, wall_ids)
-        
+
+        # Clear LiDAR cache and reset sensors for all environments being reset
+        for idx, env_id in enumerate(env_ids):
+            if env_id < len(self.lidar_paths) and self.lidar_paths[env_id] is not None:
+                try:
+                    _range_sensor.clear_cache(self.lidar_paths[env_id])
+                    self.lidar_interface.reset_sensor(self.lidar_paths[env_id])
+                except Exception as e:
+                    print(f"Error resetting LiDAR for env {env_id}: {e}")
+
         # Reset position error
         current_goal_position = self._goal_positions[self.carter._ALL_INDICES, self._goal_index]
         self._position_error_vector = current_goal_position[:, :2] - self.carter.data.root_pos_w[:, :2]
@@ -434,6 +532,19 @@ class CarterEnv(DirectRLEnv):
         )
         self.goal_heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
         self._previous_heading_error = self.goal_heading_error.clone()
+        
+        # Reset collision flag - ensure correct shape handling
+        try:
+            if isinstance(env_ids, torch.Tensor):
+                self.collision_detected[env_ids] = False
+            else:
+                # If env_ids is a list-like object, convert to proper indexing format
+                env_ids_tensor = torch.tensor(list(env_ids), dtype=torch.int64, device=self.device) 
+                self.collision_detected[env_ids_tensor] = False
+        except Exception as e:
+            # Fallback: reset all collision flags
+            print(f"Warning: Error resetting collision flags: {e}")
+            self.collision_detected.fill_(False)
 
 @torch.jit.script
 def compute_rewards(
@@ -447,10 +558,6 @@ def compute_rewards(
     goal_heading_error: torch.Tensor,
     task_completed: torch.Tensor,
     _goal_index: torch.Tensor,
-    obstacle_penalty_weight: float,
-    min_safe_distance: float,
-    _sector_distances: torch.Tensor,
-    max_lidar_penalty_range: float, 
 ):
     # Position progress
     position_progress_reward = _previous_position_error - _position_error
@@ -463,34 +570,13 @@ def compute_rewards(
     task_completed = _goal_index > (_num_goals-1)
     _goal_index = _goal_index % _num_goals
 
-    relevant_distances = torch.where(
-        _sector_distances < max_lidar_penalty_range,
-        _sector_distances,
-        torch.full_like(_sector_distances, max_lidar_penalty_range),
-    )
-    
-    # Option 1: Linear penalty below safe distance
-    # proximity_penalty_term = torch.clamp(min_safe_distance - relevant_distances, min=0.0)
-
-    # Option 2: Inverse penalty (more aggressive, be careful with tuning weight)
-    proximity_penalty_term = torch.clamp(min_safe_distance / torch.clamp(relevant_distances, min=0.1), min=0.0, max=10.0) # Avoid division by zero and cap penalty
-
-    obstacle_proximity_penalty = torch.sum(proximity_penalty_term, dim=-1)
-
     composite_reward = (
         position_progress_reward*position_progress_weight +
         goal_heading_reward*heading_progress_weight +
-        goal_reached*goal_reached_reward -
-        obstacle_proximity_penalty*obstacle_penalty_weight
+        goal_reached*goal_reached_reward
     )
 
     if torch.any(composite_reward.isnan()):
         raise ValueError("Rewards cannot be NAN")
-    
-    #print("Position Progress:", position_progress_reward)
-    #print("Heading Reward:", goal_heading_reward)
-    #print("Goal Reached:", goal_reached)
-    #print("Obstacle Penalty Term:", proximity_penalty_term)
-    #print("Obstacle Penalty:", obstacle_proximity_penalty)
-    
+
     return composite_reward, task_completed, _goal_index
